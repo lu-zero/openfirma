@@ -74,18 +74,27 @@ pub fn wait_with_signal_forwarding(
     result
 }
 
-/// Map an exit status to a process exit code.
+/// Map a raw exit outcome to a process exit code.
 ///
-/// Uses the wait-reported code when the child exited normally; otherwise, when
-/// the child was terminated by a signal, follows the shell convention of
-/// `128 + signum` so callers can distinguish signal deaths.
+/// Uses the reported code when the process exited normally; otherwise, when it
+/// was terminated by a signal, follows the shell convention of `128 + signum`
+/// so callers can distinguish signal deaths. Takes plain `Option<i32>` facts
+/// rather than `std::process::ExitStatus` so a future raw-`waitpid`-based
+/// caller (which reports the same two facts through `nix::sys::wait::WaitStatus`,
+/// not `ExitStatus`) can share this mapping instead of duplicating it.
+#[cfg(unix)]
+fn exit_code_from_outcome(exit_code: Option<i32>, term_signal: Option<i32>) -> i32 {
+    exit_code.unwrap_or_else(|| term_signal.map_or(1, |signal| 128 + signal))
+}
+
+/// Map a `std::process::ExitStatus` to a process exit code.
+///
+/// See [`exit_code_from_outcome`] for the underlying convention.
 #[cfg(unix)]
 fn exit_code(status: std::process::ExitStatus) -> i32 {
     use std::os::unix::process::ExitStatusExt;
 
-    status
-        .code()
-        .unwrap_or_else(|| status.signal().map_or(1, |signal| 128 + signal))
+    exit_code_from_outcome(status.code(), status.signal())
 }
 
 /// Wait for the child while forwarding Ctrl-C termination.
@@ -188,8 +197,16 @@ fn forward_signal(child_pid: u32, backend: BackendKind, signal: Signal) {
 /// transiently empty; callers fall back to the outer child PID in that case, so
 /// a signal during the brief startup window lands on bwrap itself rather than
 /// the sandbox — harmless but silently dropped.
+///
+/// `pub(crate)` so other in-crate consumers can locate the same inner-sandbox
+/// PID this module signals — e.g. a ptrace-based governance mechanism
+/// attaching to the process the seccomp filter actually runs in, not bwrap
+/// itself. Such a consumer needs a reliable attach point, not this function's
+/// best-effort semantics (a missed ptrace attach means no enforcement at all,
+/// unlike a dropped signal); it must pair this lookup with its own
+/// synchronization, not rely on this function's startup-window fallback.
 #[cfg(target_os = "linux")]
-fn sandbox_child_pid(bwrap_pid: u32) -> Option<u32> {
+pub fn sandbox_child_pid(bwrap_pid: u32) -> Option<u32> {
     let path = format!("/proc/{bwrap_pid}/task/{bwrap_pid}/children");
     let content = std::fs::read_to_string(path).ok()?;
     parse_first_pid(&content)
@@ -200,7 +217,7 @@ fn sandbox_child_pid(bwrap_pid: u32) -> Option<u32> {
 /// The file lists a task's child PIDs separated by spaces. Returns `None` when
 /// the content is empty/blank or the first token is not a valid PID.
 #[cfg(target_os = "linux")]
-fn parse_first_pid(content: &str) -> Option<u32> {
+pub fn parse_first_pid(content: &str) -> Option<u32> {
     content.split_whitespace().next()?.parse().ok()
 }
 
