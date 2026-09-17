@@ -225,6 +225,26 @@ fn ptrace_seccomp_exec_denies_forbidden_tool_as_child_of_allowed_bash_root() {
         "FIR-366: the forbidden-tool child executed under ptrace_seccomp_exec governance, which \
          is specifically meant to gate descendant execs:\n{scenario}"
     );
+    // Distinguishes the syscall genuinely being skipped (deny_traced_exec's
+    // intended mechanism: the syscall-number register rewritten so the
+    // kernel never dispatches it, observed here as bash's own "Function
+    // not implemented" — ENOSYS — exec-failure diagnostic) from an
+    // accidental denial where the real execve still ran and failed only
+    // because the return-value register write also corrupted one of its
+    // own arguments (would surface as "Bad address" — EFAULT — instead).
+    // A post-implementation review found aarch64's original
+    // implementation only ever exercised the latter, by accident; this
+    // assertion is the regression test for that finding.
+    assert!(
+        scenario.stderr.contains("Function not implemented"),
+        "expected the denied exec to fail via ENOSYS (the syscall genuinely skipped), not some \
+         other errno — got:\n{scenario}"
+    );
+    assert!(
+        !scenario.stderr.contains("Bad address"),
+        "the denied exec failed with EFAULT, not ENOSYS — this is the accidental-denial-via-\
+         argument-corruption bug, not a genuine syscall skip:\n{scenario}"
+    );
 
     let governed = governed.lock().expect("lock governance log").clone();
     assert_only_root_governed(&governed, &bash_canonical);

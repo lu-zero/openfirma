@@ -4,13 +4,18 @@
 
 - Status: Implemented (Slices 3a/3b/3c all landed and passing against a real
   `bwrap` sandbox — see each slice's own "implementation findings"
-  subsection below; **post-implementation adversarial review not yet
-  obtained**, required before this plan can be considered fully delivered.
-  Pre-implementation: two independent review rounds complete — the first
-  invalidated by an unauthorized overwrite and restored, then re-verified by
-  a second, properly-scoped fresh reviewer that additionally found and this
-  document incorporated `PLAN-109` through `PLAN-112`; see the note at the
-  end of this section for full provenance)
+  subsection below). Post-implementation adversarial review obtained and
+  found one critical defect (`aarch64`'s deny mechanism did not actually
+  work as designed — see Slice 3c's own findings), fixed and independently
+  re-verified against real kernel behavior; one residual gap remains open
+  (cross-process TOCTOU on the checked-vs-executed file — see Slice 3c's
+  findings and "Risks and gaps"), not yet resolved and requiring its own
+  design decision. Pre-implementation: two independent review rounds
+  complete — the first invalidated by an unauthorized overwrite and
+  restored, then re-verified by a second, properly-scoped fresh reviewer
+  that additionally found and this document incorporated `PLAN-109`
+  through `PLAN-112`; see the note at the end of this section for full
+  provenance)
 - Durable locator: `docs/architecture/ptrace-seccomp-exec-gate-plan.md`, in-repo
 - Repository revision researched: `5e0dd567` (HEAD of `feat/backend-selection`
   at research time)
@@ -825,21 +830,58 @@ no direct test, since no test scenario in this repository's e2e suite
 currently drives an `fexecve`-based command launcher. Also flagged for
 adversarial review rather than assumed correct from code inspection alone.
 
-`DEC-015`'s deny mechanism sets both the syscall-number and return-value
-registers explicitly (not relying on either architecture's own implicit
-dispatch-miss behavior for an invalid syscall number, which the plan did
-not specify to this level of detail) — empirically confirmed correct on
-`aarch64` via the FIR-366 acceptance test's actual observed behavior (the
-forbidden tool's own marker file never appears, and its would-be stdout
-line is absent), not merely asserted from the register-rewrite logic
-alone.
+**`DEC-015`'s deny mechanism initially shipped broken on `aarch64`, and
+the acceptance test above did not catch it** — a real post-implementation
+adversarial review found that writing GPR `x8`
+(`user_regs_struct.regs[8]`) through the ordinary `NT_PRSTATUS` regset
+(what `nix::sys::ptrace::{getregs,setregs}` expose, and what
+`set_syscall_number`'s `aarch64` arm originally did) has no effect on
+which syscall `aarch64` actually dispatches — the kernel's dispatch
+decision reads a separate `pt_regs.syscallno` field, populated from `x8`
+once at syscall entry but never re-read from it afterward, reachable only
+via the `NT_ARM_SYSTEM_CALL` (`0x404`) regset, which `nix` 0.31.3 does not
+wrap. Denial had appeared to work (the FIR-366 test passed) purely by
+accident: the _other_ register write in the same function (`x0` set to a
+fake `-ENOSYS` return value) also lands on `execve`'s own first argument
+register (or `execveat`'s `dirfd`), so the real syscall still ran and
+failed on its own corrupted argument (`EFAULT`) rather than being skipped
+(`ENOSYS`) as designed — a defect the original test's assertions (marker
+file absent, forbidden output absent) could not distinguish from correct
+behavior, since both failure modes produce the same _observable_ denial.
 
-Outstanding before this plan can be considered fully delivered:
-post-implementation adversarial review (required per "Final verification"
-below, not yet obtained — this implementation has not been reviewed by
-anyone other than the agent that wrote it); RHEL/CentOS Yama LSM presence
-remains Unknown, unchanged from the parent plan; `x86_64` confirmation
-requires real hardware this session did not have access to.
+Fixed (`27d3d7bb`) by issuing a raw `PTRACE_SETREGSET` call against
+`NT_ARM_SYSTEM_CALL` directly, and by adding a permanent regression
+assertion on the FIR-366 test's own captured stderr distinguishing the
+two failure modes (`"Function not implemented"` — the correct, genuine
+skip — vs. `"Bad address"` — the accidental corruption bypass). A second,
+independent review then verified the fix directly against this kernel's
+own source (`arch/arm64/kernel/{ptrace,syscall}.c`, confirming
+`REGSET_SYSTEM_CALL`'s `.set` writes `pt_regs.syscallno` and that
+dispatch gates on it, not on `x8`) and reproduced both the original bug
+(reverting to the pre-fix code reproduces the `EFAULT` failure) and the
+fix (restoring it reproduces `ENOSYS`) against the real, running test —
+not just a standalone C repro, though that was also done and matched.
+
+This is the clearest evidence in this implementation that a plan's own
+prose-level correctness claims (`DEC-015`'s "the kernel returns `-ENOSYS`
+... instead of performing the real `execve`") and a passing acceptance
+test are not sufficient proof for register-level, per-architecture
+kernel-interaction code — only a reproduction against the actual kernel
+source and observed behavior closed this gap.
+
+Outstanding before this plan can be considered fully delivered: RHEL/
+CentOS Yama LSM presence remains Unknown, unchanged from the parent plan;
+`x86_64` confirmation requires real hardware this session did not have
+access to; the cross-process TOCTOU on the checked-vs-executed file
+(`DEC-017`'s freeze only covers sibling threads of the same tracee, not a
+second process able to replace the resolved path between the check and
+the tracee's own later `execve`) was flagged by the same
+post-implementation review as unclosed and not proven exploitable in the
+time available — a genuine residual gap, not newly introduced by this
+implementation, requiring its own design decision (e.g. inode-pinning via
+`O_PATH`, or re-verifying via `/proc/<tid>/exe` post-exec) before this
+strategy can be trusted against a hostile multi-process sandboxed
+workload, not just a hostile single-process one.
 
 ## Risks and gaps
 

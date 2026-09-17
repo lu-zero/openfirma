@@ -981,20 +981,95 @@ fn read_remote_cstring(pid: Pid, ptr: u64) -> Result<Vec<u8>, RunError> {
 /// `x86_64` and `aarch64` are not guaranteed to populate the return
 /// register identically for that case, so both are set explicitly here
 /// instead of assumed.
+///
+/// # Errors
+///
+/// Returns an error when either register write fails.
 fn deny_traced_exec(tid: Pid, mut regs: libc::user_regs_struct) -> Result<(), RunError> {
-    set_syscall_number(&mut regs, -1);
     set_syscall_return_value(&mut regs, -i64::from(libc::ENOSYS));
     ptrace::setregs(tid, regs)
-        .map_err(|error| RunError::Internal(format!("exec guard: deny setregs {tid}: {error}")))
+        .map_err(|error| RunError::Internal(format!("exec guard: deny setregs {tid}: {error}")))?;
+    set_syscall_number(tid, -1)
 }
 
+/// Sets `tid`'s pending syscall number to `value` (`-1` denies).
+///
+/// On `x86_64` this is `orig_rax`, one field of the same `user_regs_struct`
+/// [`deny_traced_exec`] already has in hand from `ptrace::getregs` and
+/// writes back via `ptrace::setregs` (`NT_PRSTATUS`).
+///
+/// **`aarch64` is not the same field under a different name — it is a
+/// wholly separate kernel-tracked value `NT_PRSTATUS` cannot reach at
+/// all.** GPR `x8` (`user_regs_struct::regs[8]`, reachable via
+/// `NT_PRSTATUS`) holds the syscall number only as an artifact of the
+/// calling convention; the kernel's actual dispatch decision on continue
+/// reads a distinct `pt_regs.syscallno` field, populated from `x8` once at
+/// syscall entry and never re-read from `x8` afterward. Writing `x8`
+/// through `NT_PRSTATUS` (what an earlier version of this function did)
+/// therefore has no effect on which syscall actually runs — confirmed by
+/// a post-implementation adversarial review, then independently
+/// reproduced: with only that GPR write, a denied `execve` executed
+/// unmodified. (Denial appeared to work at the time only because
+/// `set_syscall_return_value`'s own write also lands on `execve`'s first
+/// argument register / `execveat`'s `dirfd`, corrupting it into a
+/// reliably-invalid pointer/fd — the real syscall still ran and failed on
+/// its own corrupted argument, `EFAULT`, not because it was skipped.)
+///
+/// The regset that actually reaches `pt_regs.syscallno` is
+/// `NT_ARM_SYSTEM_CALL` (`0x404`) — absent from `nix` 0.31.3's
+/// `RegisterSetValue` (only `NT_PRSTATUS`/`NT_PRFPREG`/`NT_PRPSINFO`/
+/// `NT_TASKSTRUCT`/`NT_AUXV`), so this issues the raw `PTRACE_SETREGSET`
+/// call directly, mirroring `nix`'s own internal `getregset`/`setregset`
+/// shape exactly (request, pid, the `NT_*` type cast to an address-sized
+/// value, an `iovec` pointing at the single `int` this regset expects).
+/// `-1` is the same "skip this syscall entirely" sentinel `x86_64`'s
+/// `orig_rax = -1` is — other ptrace-based tools use the identical
+/// technique on this architecture.
+///
+/// # Errors
+///
+/// Returns an error when the underlying `ptrace(2)` call fails.
 #[cfg(target_arch = "x86_64")]
-fn set_syscall_number(regs: &mut libc::user_regs_struct, value: i64) {
+fn set_syscall_number(tid: Pid, value: i64) -> Result<(), RunError> {
+    let mut regs = ptrace::getregs(tid)
+        .map_err(|error| RunError::Internal(format!("exec guard: getregs {tid}: {error}")))?;
     regs.orig_rax = value.cast_unsigned();
+    ptrace::setregs(tid, regs).map_err(|error| {
+        RunError::Internal(format!("exec guard: set syscall number {tid}: {error}"))
+    })
 }
+
 #[cfg(target_arch = "aarch64")]
-fn set_syscall_number(regs: &mut libc::user_regs_struct, value: i64) {
-    regs.regs[8] = value.cast_unsigned();
+fn set_syscall_number(tid: Pid, value: i64) -> Result<(), RunError> {
+    const NT_ARM_SYSTEM_CALL: i32 = 0x404;
+
+    let mut scno = i32::try_from(value).unwrap_or(-1);
+    let mut iov = libc::iovec {
+        iov_base: std::ptr::addr_of_mut!(scno).cast::<libc::c_void>(),
+        iov_len: std::mem::size_of::<i32>(),
+    };
+    // SAFETY: `iov` points at `scno`, a live local exactly the size this
+    // regset expects (one `int`), for the duration of this call only.
+    // `tid` names a real tracee currently stopped at a ptrace-event stop
+    // (the caller holds it stopped at `PTRACE_EVENT_SECCOMP`), the
+    // precondition `PTRACE_SETREGSET` requires.
+    let ret = unsafe {
+        libc::ptrace(
+            libc::PTRACE_SETREGSET,
+            tid.as_raw(),
+            std::ptr::without_provenance_mut::<libc::c_void>(
+                usize::try_from(NT_ARM_SYSTEM_CALL).unwrap_or_default(),
+            ),
+            std::ptr::addr_of_mut!(iov).cast::<libc::c_void>(),
+        )
+    };
+    if ret == -1 {
+        return Err(RunError::Internal(format!(
+            "exec guard: PTRACE_SETREGSET(NT_ARM_SYSTEM_CALL) {tid}: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(target_arch = "x86_64")]

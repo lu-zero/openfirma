@@ -2,7 +2,7 @@
 
 ## Artifact metadata
 
-- Status: Partially implemented — Slice 1 and Slice 3 (`PtraceSeccompExec`, elaborated by its own child plan) landed; Slice 2 (`LandlockExecute`) and Slice 4 (parametrized coverage/benchmarks) not started. Post-implementation adversarial review of what has landed is required and not yet obtained. (Independent plan review complete pre-implementation, all findings corrected — see "Plan-review findings and dispositions")
+- Status: Partially implemented — Slice 1 and Slice 3 (`PtraceSeccompExec`, elaborated by its own child plan) landed; Slice 2 (`LandlockExecute`) and Slice 4 (parametrized coverage/benchmarks) not started. Post-implementation adversarial review of Slice 3 has been obtained: it found and this implementation fixed a critical defect (aarch64's deny mechanism did not actually work), independently re-verified; one residual gap (a cross-process TOCTOU) remains open. (Independent plan review complete pre-implementation, all findings corrected — see "Plan-review findings and dispositions")
 - Durable locator: `docs/architecture/selectable-execution-governance-plan.md` (this file, in-repo)
 - Repository revision researched: `9d761b2b36afa69c32eb1a5cc66e8b9ba45dc34a`
 - Task or requirement source: `~/Sources/openfirma-notes/requirements.md` (Workstream 2), user request to make governance mechanisms selectable at runtime from one binary so Workstream 2 candidates can be benchmarked side by side
@@ -205,14 +205,19 @@ Implemented and committed, elaborated by its own child plan
 see that document's own per-slice "implementation findings" for the full
 account, including two real bugs a real `bwrap` launch surfaced (a
 mount-namespace-invisible handshake socket, and `sandbox_child_pid`
-attaching to the wrong pid) and the `DEC-016`/`DEC-018` architecture-
+attaching to the wrong pid), the `DEC-016`/`DEC-018` architecture-
 confirmation finding (this session's environment is `aarch64`, not
-`x86_64` as this plan's own text assumed as the default). The FIR-366
+`x86_64` as this plan's own text assumed as the default), and a critical
+defect a post-implementation adversarial review found and this
+implementation then fixed and independently re-verified: `aarch64`'s deny
+mechanism did not actually skip the denied syscall (it only appeared to
+work, via an unrelated register-write side effect). The FIR-366
 acceptance scenario passes under `PtraceSeccompExec`
 (`ptrace_seccomp_exec_denies_forbidden_tool_as_child_of_allowed_bash_root`)
 while `Inherited`'s own control test continues to fail as expected.
-Post-implementation adversarial review is required (per this plan's own
-"Final verification" below) and not yet obtained.
+Post-implementation adversarial review has been obtained (per this plan's
+own "Final verification" below); one residual gap remains open (a
+cross-process TOCTOU on the checked-vs-executed file), not yet resolved.
 
 ### Slice 4: parametrized coverage and Workstream 2 evidence
 
