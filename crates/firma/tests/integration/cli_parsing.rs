@@ -98,6 +98,17 @@ fn parse_dns_stub_with_listen() {
 }
 
 #[test]
+fn parse_dns_stub_with_inherited_fds() {
+    parse_ok(&[
+        "__dns-stub",
+        "--inherited-udp-fd",
+        "3",
+        "--inherited-tcp-fd",
+        "4",
+    ]);
+}
+
+#[test]
 fn parse_proxy_bridge_with_uds() {
     parse_ok(&[
         "__proxy-bridge",

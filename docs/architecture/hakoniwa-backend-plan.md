@@ -2,7 +2,7 @@
 
 ## Artifact metadata
 
-- Status: Accepted (independent plan review complete, all nine findings corrected — see "Plan-review findings and dispositions")
+- Status: Accepted for Slices 1-6 (independent plan review complete, all nine findings corrected — see "Plan-review findings and dispositions"). `DEC-012`/Slice 7 (bind the DNS-stub's sockets before capability drop and inherit them across `exec`, closing a real port-53 bind failure in Slice 3's shipped implementation) is **Accepted** for implementation — two independent plan-review rounds complete: the first (`PLAN-010` through `PLAN-014`) reviewed an earlier host-side-responder-relay design and prompted a full redesign (one finding, `PLAN-012`, found a namespace-wide security-posture widening in that design); the second (`PLAN-015` through `PLAN-022`) reviewed the redesigned fd-inheritance mechanism itself and found it sound in principle, with eight implementation-trap/completeness findings, all corrected. Slice 7 is implemented, verified, and independently post-implementation reviewed — see its own "Implemented" notes and post-implementation review addendum.
 - Durable locator: `docs/architecture/hakoniwa-backend-plan.md` (this file, in-repo)
 - Repository revision researched: `9d761b2b36afa69c32eb1a5cc66e8b9ba45dc34a`
 - Task or requirement source: `~/Sources/openfirma-notes/todo/pending.md` ("If Hakoniwa is prototyped: ... Scope as a fourth `BackendKind` spike with a written sunset date"); user request to build this as a new `HakoniwaBackend: SandboxBackend` with real interfacing, not a `Container::command()` shortcut
@@ -92,6 +92,13 @@
 - Semantic predicate: for a `HakoniwaBackend`-launched sandbox with `enforce_network_namespace = true`, no process inside the sandbox can reach any address except loopback (and, through the DNS-stub/egress-guard/proxy-bridge chain, the Sidecar) — the same guarantee `BwrapBackend` already provides and the `network.rs`/`http.rs` e2e tests already prove for it.
 - Primary owner: `HakoniwaBackend`/the runner binary's namespace+loopback-bringup+DNS-stub bootstrap sequence, independently of `BwrapBackend`'s equivalent.
 - Detailed proof: see Appendix "Detailed proof obligations", `PROOF-001`.
+- **Extended by `DEC-012` (Slice 7)**: this predicate's own "through the
+  DNS-stub/.../chain, the Sidecar" clause already claims the DNS-stub half
+  of that chain works — but Slice 3's implementation, as shipped, silently
+  fails to bind port 53 (a real, reproducible gap found and fixed by
+  `DEC-012`, not previously known when Slice 3 was marked "Implemented").
+  Slice 7 closes that gap, making this invariant's own text true in
+  practice for `HakoniwaBackend`, not just in intent.
 
 ### `INV-002`: `.firma`/config masking is at least as robust as `BwrapBackend`'s (symlink-swap and mount-alias-re-leak resistant)
 
@@ -113,6 +120,103 @@
 - Choice: `network.rs`/`filesystem.rs`/`http.rs` under `tests/e2e/scenarios/child_process_governance/` gain a backend parameter (via the same `TestWorld`/`scaffold_config` seam extension already planned in `docs/architecture/selectable-execution-governance-plan.md`'s Slice 1, if that has landed, or a smaller Hakoniwa-specific equivalent otherwise) and run against both `Bwrap` and `Hakoniwa`.
 - Rationale and evidence: these three tests assert exactly the guarantees this plan's `INV-001`/`INV-002` need proven; forking them into bwrap-only and Hakoniwa-only copies would let the two drift silently.
 - Consequences and rejected alternatives: rejected duplicating the test files per backend (duplication risk); if the execution-governance plan's Slice 1 seam hasn't landed yet when this work starts, add the minimal version of that seam here instead of blocking on the other plan.
+
+### `DEC-012`: Bind the DNS-stub's sockets before capability drop, and inherit them across `exec` — not a host-side responder or a namespace-wide capability widening
+
+- Choice: `execute_dns_stub` (`crates/firma-run/src/dns_stub/mod.rs`) tries
+  to bind `127.0.0.1:53` directly inside the sandbox's own network
+  namespace today, which fails — confirmed empirically against the real
+  `firma-hakoniwa-runner` binary, not assumed (see Technical evidence).
+  Fixed by binding both the UDP and TCP `127.0.0.1:53` sockets directly
+  inside `firma-hakoniwa-runner`'s existing closure (`main.rs`, right
+  where `bring_up_loopback()` already succeeds — confirmed empirically
+  that a direct bind there succeeds with **no** sysctl or capability
+  change of any kind involved), clearing `FD_CLOEXEC` on both raw fds so
+  they survive the later `fork`+`exec` into `firma __dns-stub`, and
+  passing their fd numbers to that child via two new, additive CLI
+  arguments (e.g. `--inherited-udp-fd <n> --inherited-tcp-fd <n>`).
+  `execute_dns_stub` gains matching optional fields on `DnsStubInput`:
+  when both are absent (today's default, `BwrapBackend`'s unmodified
+  call site), it binds `args.listen` itself exactly as today, byte-for-
+  byte unchanged; when both are present (Hakoniwa's own call site only),
+  it reconstructs `UdpSocket`/`TcpListener` via
+  `FromRawFd::from_raw_fd` instead of binding at all, and every other
+  line of its existing DNS-refusal logic (`refused_response`, `run_udp`,
+  `run_tcp`, `handle_tcp_client`) runs completely unchanged — no
+  DNS-parsing logic moves anywhere, no new host-side process exists, and
+  no relay/correlation design is needed at all.
+- Rationale and evidence: root-caused and demonstrated end to end at
+  `~/Sources/openfirma-notes/notes/dns-stub-privileged-port-bind.md` and
+  `~/Sources/openfirma-notes/bench/fixtures/dns-stub-bridge-demo/` — an
+  earlier iteration of this design (a host-side responder reached over a
+  relayed Unix datagram socket, plus lowering the sandbox netns's own
+  `ip_unprivileged_port_start` to 0) was fully validated there and in a
+  first independent plan-review round, but was **superseded by this
+  simpler design after that review surfaced a genuine, unresolved
+  security-posture tradeoff in the sysctl-widening approach** (see
+  "Plan-review findings and dispositions" below) — investigating an
+  alternative led directly to this one. Confirmed by a temporary,
+  reverted probe directly in `firma-hakoniwa-runner/src/main.rs`: a
+  direct `UdpSocket::bind("127.0.0.1:53")` inserted into the closure,
+  immediately after `bring_up_loopback()` succeeds, binds successfully
+  with no sysctl write at all — `CAP_NET_BIND_SERVICE` is genuinely
+  available at that point, not just `CAP_NET_ADMIN`. The fd-inheritance
+  mechanism itself (clear `FD_CLOEXEC`, `exec` a child, reconstruct a
+  socket from the inherited fd number via `FromRawFd::from_raw_fd`) was
+  independently verified against a minimal, from-scratch two-binary
+  reproduction outside Hakoniwa entirely — the child correctly received
+  and used the parent's already-bound socket. Root cause of the original
+  failure, precisely: capabilities do not survive an `execve` for a
+  non-root-mapped process (standard Linux semantics); `bring_up_loopback()`'s
+  own `ioctl` and this design's own `bind()` both succeed because they run
+  before any `exec` crosses that boundary, while everything spawned
+  afterward (a plain, unmodified `spawn_dns_stub`/the final wrapped
+  command) does not retain any capability at all — this design sidesteps
+  that entirely by binding once, early, and handing over the already-open
+  result, rather than needing the capability to exist again later.
+- Consequences and rejected alternatives: **rejected the host-side-responder
+  design** this decision originally proposed (moving `refused_response`
+  logic to a new process reached over a relayed `UnixDatagram`, plus
+  lowering `ip_unprivileged_port_start` to 0 for the whole sandbox
+  netns) — independent plan review found two real problems with it: (1)
+  a per-query relay-socket correlation design was needed to avoid
+  cross-talk between `execute_dns_stub`'s already-concurrent
+  `run_udp`/`run_tcp` threads (solvable, but added real complexity), and
+  (2) more fundamentally, the sysctl write is namespace-wide, so it also
+  handed the untrusted wrapped command itself ambient ability to bind any
+  port below 1024, not just the relay — a real, if narrow, security-
+  posture widening with no clear benefit once the fd-inheritance
+  alternative was found to work. This design has neither problem: no new
+  process, no relay, no correlation question, and the sandbox's network
+  namespace configuration is completely untouched — the _only_ thing
+  different is that two specific, already-open sockets exist, owned
+  by the same process that already runs `refused_response` today.
+  Rejected fixing `BwrapBackend` in the same pass — its capability drop
+  happens **before** any of `firma-run`'s own code runs at all (confirmed
+  empirically: even with `bwrap --proc /proc` giving a properly
+  namespace-aware procfs, the entrypoint script itself already lacks
+  `CAP_NET_ADMIN` — "Permission denied", not "Read-only filesystem" —
+  and `bwrap --cap-add`/`--cap-drop` only apply when bwrap itself runs
+  privileged, which this usage does not); bwrap has no equivalent point
+  in `firma-run`'s own code where a fd could be bound before its
+  capability drop, so this same fd-inheritance approach does not
+  transfer to it either. Closing the identical gap for `BwrapBackend`
+  would need a new, host-side helper process that pre-creates and
+  configures the network namespace before bwrap ever runs, then execs
+  `bwrap --share-net` instead of `--unshare-net` — a materially larger,
+  separate mechanism; deferred and tracked in
+  `~/Sources/openfirma-notes/todo/pending.md`, not silently left unfixed.
+  Rejected introducing `smol` or any other async runtime — `tokio` is
+  already this workspace's async runtime elsewhere, but `dns_stub.rs`
+  (the exact code this extends) is deliberately plain, blocking
+  `std::net`/`std::thread` throughout, and this fix adds only a fd-number
+  CLI argument and an alternate socket-construction path — no new
+  concurrency shape at all. Rejected `smoltcp` for this piece — real OS
+  sockets already handle IP/UDP correctly inside the namespace; the
+  actual problem was a privileged-port/capability one at the socket
+  layer, which frame-level parsing does not touch (contrast a VM-based
+  backend's virtio-net device, which has no real host socket at all —
+  `smoltcp`-style frame parsing is the right fit there, just not here).
 
 ## Implementation slices
 
@@ -208,6 +312,227 @@ Reusing `sandbox_child_pid`/`parse_first_pid` turned out to need one adjustment 
 - Focused verification: full e2e suite; benchmark reproducibility.
 - Dependencies: Slices 1-5.
 - Intentionally unsupported: this slice does not itself constitute the security audit `DEC-010`'s sunset condition requires — it proves functional parity, not adversarial robustness.
+
+### Slice 7: bind the DNS-stub's sockets before capability drop, inherit across `exec` (`DEC-012`)
+
+- Observable capability: a DNS query issued from inside a `Hakoniwa`
+  sandbox against `127.0.0.1:53` receives a real `REFUSED` response
+  (matching the query's own ID and question) instead of the sandbox
+  silently failing to bind that port at all — closing the gap in Slice
+  3's own "Implemented" claim (see `INV-001`'s extension above).
+  `BwrapBackend`'s own call site is untouched and its existing (silently
+  logged) failure mode is unchanged — this slice is Hakoniwa-only, per
+  `DEC-012`'s own rejected alternatives.
+- Program design (types and call trace):
+  - The closure at `main.rs`'s `command_from_closure` call gains one
+    step, right after `bring_up_loopback()` succeeds and before
+    `run_entrypoint_orchestration` runs: bind `UdpSocket::bind(
+    "127.0.0.1:53")` and `TcpListener::bind("127.0.0.1:53")` directly
+    (confirmed to succeed here with no sysctl/capability change needed —
+    see `DEC-012`), clear `FD_CLOEXEC` on both raw fds via
+    `nix::fcntl::fcntl`/`FcntlArg::F_SETFD` — **corrected by plan review
+    (`PLAN-016`)**: not a raw `libc::fcntl` call; this crate's own
+    `nix` dependency (already present, `fcntl` is unconditionally
+    available, no feature gate needed) exposes the identical safe
+    wrapper `crates/firma-run/src/backend/linux_bwrap/mod.rs`'s
+    `clear_fd_cloexec` already uses for the same need (clearing
+    `CLOEXEC` on bwrap's own seccomp fd before `Command::spawn()`) —
+    mirror that function locally rather than reaching for `unsafe`.
+    **Corrected by plan review (`PLAN-017`)**: the bound `UdpSocket`/
+    `TcpListener` _values_ (not just their raw fd numbers) must stay
+    alive — not dropped — until after `spawn_dns_stub`'s own
+    `Command::spawn()` call has actually forked; dropping either socket
+    value first closes the underlying fd before inheritance can happen,
+    since both types' `Drop` impls close their fd. Keep both sockets
+    alive in the same scope that calls `spawn_dns_stub`, passing only the
+    fd _numbers_ onward from there.
+  - `spawn_dns_stub` (`firma-hakoniwa-runner/src/main.rs`) gains two new
+    parameters (the inherited UDP/TCP fd numbers) and passes
+    `--inherited-udp-fd <n> --inherited-tcp-fd <n>` to `firma __dns-stub`,
+    additively — the CLI gains these two new, optional arguments on
+    `DnsStubArgs` (`crates/firma/src/args/run.rs`), `BwrapBackend`'s own
+    call site (`bwrap_entrypoint.sh`) never passes them.
+  - **Corrected by plan review (`PLAN-019`)**: this slice's call trace
+    was missing its own actual glue site —
+    `crates/firma/src/services/dns_stub.rs::run` today hardcodes
+    `DnsStubInput { listen: args.listen }` from the parsed CLI args; it
+    must also thread the two new fd fields through, or the whole slice
+    would compile, pass all existing tests, and ship as a silent no-op
+    for `HakoniwaBackend` (nothing would force a compile error, since
+    both new fields are additive `Option`s defaulting to `None`).
+  - `execute_dns_stub` (`dns_stub/mod.rs`) gains matching optional fields
+    on `DnsStubInput`: when both are `Some`, it builds `UdpSocket`/
+    `TcpListener` via `unsafe { FromRawFd::from_raw_fd(fd) }` instead of
+    calling `bind(args.listen)`; when either is `None` (today's only
+    behavior, `BwrapBackend`'s unmodified call site), nothing changes.
+    **Corrected by plan review (`PLAN-015`)**: `dns_stub/mod.rs` has no
+    existing `unsafe` code and no module-level allowance — this crate's
+    workspace-inherited `unsafe_code = "warn"` lint is promoted to a
+    hard failure under `just lint`/CI, so this new call needs an
+    explicit `#![expect(unsafe_code, reason = "...")]` (or a
+    function-scoped `#[expect]`), matching the exact pattern this
+    crate's own `egress_guard.rs`/`execution_governance/ptrace_seccomp.rs`
+    already use for their own justified `unsafe` blocks — not left
+    implicit. `run_udp`/`run_tcp`/`handle_tcp_client`/`refused_response`
+    themselves are entirely untouched — they operate on a
+    `UdpSocket`/`TcpListener` either way, indifferent to how it was
+    constructed.
+  - **Corrected by plan review (`PLAN-018`)**: `run_udp`'s existing
+    error handling treats every `recv_from` failure as non-fatal
+    (log and loop forever) — safe today only because `bind()` either
+    fully succeeds or `execute_dns_stub` fails fast via its own `?`
+    beforehand. The inherited-fd path removes that guarantee:
+    `from_raw_fd` never validates the fd at all, so a wrong/stale
+    inherited fd would not fail until first use, inside an already-
+    detached thread, where it would spin and flood logs indefinitely
+    instead of terminating — worse than today's clean bind failure.
+    Validate the inherited fd (e.g. `getsockopt(SO_TYPE)`) before
+    reconstructing the socket, and fail closed with a clear error if it
+    doesn't look like the expected socket type.
+  - **Corrected by plan review (`PLAN-022`)**: the two new fd fields
+    (`inherited_udp_fd`/`inherited_tcp_fd`, both plain `Option<RawFd>`)
+    have no distinguishing type from each other — an implementer could
+    swap them (e.g. an argument-ordering slip in `spawn_dns_stub`'s two
+    `.arg()` calls, or in `services/dns_stub.rs`'s field construction)
+    and the code would still compile. A swap produces an asymmetric,
+    silent-until-first-use failure (`run_tcp`'s `accept()` on the
+    actually-UDP fd fails loud; `run_udp`'s `recv_from()` on the
+    actually-TCP-listener fd hits `PLAN-018`'s own spin-forever failure
+    mode) with no test coverage for the swapped case. Add a unit test
+    asserting a deliberately-swapped pair is rejected/fails safely
+    (this pairs naturally with `PLAN-018`'s own `SO_TYPE` validation,
+    which would also catch a swap).
+- Affected decisions and invariants: `DEC-012` (this slice); extends
+  `INV-001` (see above).
+- Proof obligations: extends `PROOF-001` (appendix) — new stimulus/effect
+  pair for the inherited-socket path.
+  - A new unit test in `dns_stub/mod.rs` asserting `execute_dns_stub`,
+    given a pre-bound `UdpSocket`/`TcpListener` pair (constructed in the
+    test itself, its raw fds passed the same way production code would),
+    correctly serves `refused_response` over both — proving the
+    inherited-fd path exercises the exact same logic as the bind path,
+    not a parallel implementation.
+  - A new e2e test (`tests/e2e/scenarios/hakoniwa_backend.rs` or a new
+    sibling file) asserting a real `firma run --backend hakoniwa`
+    sandboxed process can resolve (i.e. receive a real `REFUSED`, not a
+    hang/timeout) against `127.0.0.1:53` — the first test anywhere to
+    assert actual DNS-stub behavior end to end for `HakoniwaBackend` (no
+    existing test does, per this plan's own research).
+  - **Corrected by plan review (`PLAN-020`)**: the originally-listed
+    "regression test confirming `BwrapBackend`'s own call site is
+    unchanged" was a vacuous control — `dns_stub/mod.rs`'s existing unit
+    tests never call `execute_dns_stub` itself (only its pure helper
+    functions, untouched either way by this change), so their continuing
+    to pass proves nothing about the `bind()`-only branch. Replaced with
+    a real positive-control unit test that calls `execute_dns_stub` with
+    both new fields `None` and asserts it still binds `args.listen`
+    successfully — the actual code path `BwrapBackend` depends on.
+  - A test confirming the sandbox's network namespace configuration
+    itself is unaffected by this change (e.g. the wrapped command still
+    cannot bind an _unrelated_ privileged port, such as `80`) — the
+    property this design specifically preserves relative to the
+    rejected, namespace-wide-sysctl alternative.
+  - Added per `PLAN-022` above: a deliberately-swapped-fd test.
+- Focused verification: `cargo nextest run -p firma-run` (unit); the new
+  e2e test; existing `hakoniwa_backend_blocks_network_like_bwrap` and the
+  `child_process_governance` suite continue passing unchanged.
+- Dependencies: Slice 3 (the DNS-stub bootstrap sequence this extends).
+- Intentionally unsupported, explicitly not silently dropped: `BwrapBackend`'s
+  identical (but silently logged) DNS-stub bind failure — deferred,
+  tracked in `~/Sources/openfirma-notes/todo/pending.md`, per `DEC-012`'s
+  own rejected alternatives. A defensive `fd > 2` assertion on the
+  inherited sockets (`PLAN-021`, low-confidence/speculative — stdio stays
+  open throughout this process's life today, so not currently reachable)
+  is noted but not required by this slice.
+
+**Implemented.** All eight second-round findings (`PLAN-015` through
+`PLAN-022`) landed exactly as corrected in the plan text: `execute_dns_stub`
+gained `inherited_udp_fd`/`inherited_tcp_fd: Option<RawFd>` on `DnsStubInput`,
+validated via `nix::sys::socket::getsockopt(..., SockType)` before trusting
+either fd (closing both `PLAN-018`'s spin-forever risk and `PLAN-022`'s
+same-typed-swap risk with one mechanism), behind a function-scoped
+`#[expect(unsafe_code, ...)]` per `PLAN-015`. `firma-hakoniwa-runner` gained
+`bind_dns_stub_sockets`/`clear_fd_cloexec` (the latter mirroring
+`linux_bwrap/mod.rs`'s own `clear_fd_cloexec` via `nix::fcntl`, duplicated
+rather than shared since this crate doesn't depend on `firma-run`, per
+`PLAN-016`), called from the closure right after `bring_up_loopback()`
+succeeds; `run_entrypoint_orchestration` and `spawn_dns_stub` both updated
+to thread the sockets through, and `crates/firma/src/services/dns_stub.rs::run`
+— the exact glue site `PLAN-019` flagged as missing from the original call
+trace — updated to pass the two new CLI-parsed fds into `DnsStubInput`.
+
+One correction beyond what either review round specifically named, found
+during implementation: `spawn_dns_stub` takes `udp`/`tcp` **by value**, not
+by reference, and clippy's `needless_pass_by_value` (part of this crate's
+`clippy::pedantic` gate) flagged this as suspicious, since the function
+body never reads through them after extracting their fd numbers. The
+by-value signature is deliberate, not incidental — see the file's own
+`#[expect(clippy::needless_pass_by_value, reason = "...")]` — the sockets
+must be dropped by `spawn_dns_stub` itself, immediately after
+`Command::spawn()` has forked, so this process's own copies of these
+listening sockets do not survive into whatever it `exec`s into next (the
+proxy bridge, `egress-guarded-run`, or the final **wrapped, untrusted**
+command) — a reference would leave that decision to `run_entrypoint_orchestration`,
+which keeps running (and eventually `exec`s) far past the point where
+these sockets should already be closed in this process. Passing by value
+and letting them drop at function end is what actually closes this: had
+the wrapped command inherited these fds too, it would have gained a live
+handle to the DNS stub's own listening sockets — not a namespace-wide
+capability widening (`PLAN-012`'s original concern), but a concrete,
+unintended new capability of the same general shape this slice's own
+design was chosen specifically to avoid.
+
+Corrected one factual inaccuracy in `PLAN-014`'s own disposition, found
+during implementation: the redesigned fd-number fields are `Option<i32>`,
+which **is** `Copy` (`i32: Copy`) — unlike the superseded design's
+`Option<PathBuf>`, so `DnsStubArgs`'s `Copy` derive did not in fact need to
+be dropped. Recorded as `superseded`, not `corrected`, in that finding's
+own disposition, since the finding's premise (not just its suggested fix)
+turned out not to apply to the accepted design.
+
+Focused verification (as implemented): a new real e2e test,
+`hakoniwa_backend_dns_stub_answers_real_queries`
+(`tests/e2e/scenarios/hakoniwa_backend.rs`), runs a real `firma run
+--backend hakoniwa` invocation whose wrapped command sends one well-formed
+DNS query to `127.0.0.1:53` via a raw UDP socket (Python, since bash has no
+native DNS client) and asserts a `REFUSED` response with the query's own
+transaction ID preserved — passing end to end, proving `DEC-012` actually
+closes Slice 3's real bind failure, not just in isolation. New unit tests in
+`crates/firma-run/src/dns_stub/mod.rs` cover: the inherited-fd path serving
+real queries identically to the bind path; a swapped-fd pair rejected
+deterministically; exactly one of the two fd arguments being set rejected;
+and (`PLAN-020`'s own correction) a real positive control proving
+`BwrapBackend`'s unmodified bind-and-serve path still works. `cargo nextest
+run --profile ci --ignore-default-filter -p firma --test e2e` (36 tests,
+including all Hakoniwa-backend scenarios), the full default-profile
+workspace suite (2,662 tests), workspace-wide `cargo clippy -- -D
+warnings`, and `dprint check` are all clean.
+
+**Post-implementation independent review (fresh reviewer, commit
+`e5a4caa4`), two low-severity findings, both addressed:**
+
+1. Slice 7's own design text required a test confirming the sandbox's
+   network namespace itself is unaffected by this change (the wrapped
+   command still cannot bind an unrelated privileged port) — this landed
+   silently, neither implemented nor recorded as deferred, unlike every
+   other intentionally-deferred item in this document. Fixed: added
+   `hakoniwa_backend_wrapped_command_cannot_bind_an_unrelated_privileged_port`
+   (`tests/e2e/scenarios/hakoniwa_backend.rs`), asserting the wrapped
+   command still fails to bind `127.0.0.1:80` — proving the accepted
+   fd-inheritance design does not widen the netns-wide port-bind floor the
+   way the rejected sysctl-based design would have.
+2. The four new `execute_dns_stub` unit tests were added to
+   `dns_stub/mod.rs`'s existing inline `#[cfg(test)] mod tests` rather than
+   a `tests/integration/` suite — noted as a pre-existing convention this
+   module already used (it already inline-tests private helpers like
+   `refused_response`), not a new departure; left as-is, no correction
+   needed.
+
+The reviewer also independently verified the new e2e test is a genuine
+regression guard, not vacuous: reverting `bind_dns_stub_sockets` to always
+return `None` (reproducing the pre-fix behavior) made
+`hakoniwa_backend_dns_stub_answers_real_queries` fail with `CHILD DNS NO
+RESPONSE`, confirmed directly rather than assumed.
 
 ## Risks and gaps
 
@@ -523,6 +848,489 @@ state a concrete conflict) is recorded above under "Risks and gaps" as an unreso
 rather than a disposed finding, since the reviewer explicitly did not assert a conflict — only that
 it needs checking during implementation.
 
+### First review round — `DEC-012`/Slice 7 (DNS-stub port-53 bind fix)
+
+Independent review of `DEC-012`/`Slice 7`/`INV-001`'s extension only (a fresh reviewer, no access
+to this plan's authoring rationale). No prior `PLAN-*` findings existed against this document before
+this round; new findings are numbered `PLAN-010` through `PLAN-014`.
+
+The reviewed candidate at the time was the **host-side responder + relayed `UnixDatagram` + netns-wide
+`ip_unprivileged_port_start` write** design. `PLAN-012`'s finding — a genuine, previously undiscussed
+security-posture tradeoff in that sysctl write — prompted investigating an alternative during
+disposition, which led to a materially simpler design (bind before capability drop, inherit the fd
+across `exec`) that the user selected explicitly and that removes the conditions `PLAN-010` and
+`PLAN-011` were about entirely. Both findings' own analysis was correct against the design as it stood
+at review time and is preserved verbatim below; their dispositions record why they became moot rather
+than needing their own separate fix.
+
+```yaml
+id: PLAN-010
+severity: critical
+category: correctness (concurrency/correlation)
+classification: confirmed-conflict
+claim: >
+  The relay design's cited validation (dns-stub-bridge-demo) is single-threaded, but
+  execute_dns_stub's actual production shape spawns a dedicated thread for run_udp and a fresh
+  thread per accepted TCP connection. The plan text never specified whether the relay's own
+  UnixDatagram was one shared, already-bound socket (the demo's literal shape) or fresh per query;
+  read literally, a shared socket has no way to correlate an arriving reply back to the query that
+  sent it, once two queries are genuinely concurrent.
+evidence:
+  - "bench/fixtures/dns-stub-bridge-demo/src/bin/sandbox_relay.rs (single-threaded)"
+  - "crates/firma-run/src/dns_stub/mod.rs (run_udp on its own thread; run_tcp spawns per-connection)"
+reachability: >
+  Directly reachable: any two DNS queries in flight concurrently inside a HakoniwaBackend sandbox
+  (a UDP query racing a TCP query, or two concurrent TCP connections).
+invariant_or_boundary: INV-001 (the DNS-stub half of the chain this extension claims to fix).
+impact: >
+  Concurrent queries could receive cross-talked replies (wrong transaction ID/question) -- a
+  functional regression Slice 7's own single-query test list would not have caught.
+correction: >
+  Either use a fresh, uniquely-bound UnixDatagram per query, or an explicit correlation scheme, plus
+  a concurrent-query test.
+confidence: high
+assumptions: []
+```
+
+```yaml
+disposition:
+  status: superseded
+  rationale: >
+    The finding's own analysis is correct against the relay design it reviewed, and was corrected
+    in-place first (fresh, uniquely-bound socket per query, plus a concurrent-query test -- both
+    briefly present in this document). That whole design was then replaced by DEC-012's
+    bind-before-capability-drop/fd-inheritance approach (prompted by PLAN-012, see below), which has
+    no relay, no shared socket, and no correlation question at all -- execute_dns_stub's existing
+    single-process run_udp/run_tcp/handle_tcp_client code is untouched. PLAN-010's own concern does
+    not apply to the design actually accepted.
+  incorporated_at: "Not applicable to the accepted design; was briefly incorporated into the
+    now-superseded relay design before the redesign"
+  decided_by: planner (redesign prompted by user selecting the narrower-security-footprint
+    alternative after PLAN-012)
+```
+
+```yaml
+id: PLAN-011
+severity: medium
+category: implementation trap (cfg-gating)
+classification: confirmed-conflict
+claim: >
+  crates/firma-run/src/dns_stub/mod.rs:7 gates the existing host-side responder module
+  #[cfg(any(target_os = "macos", test))] -- macOS-only. The plan's new HakoniwaDnsResponderHandle
+  (Linux-only backend) never stated its own cfg, risking either never compiling into the Linux
+  binary that needs it, or silently reusing host.rs's macOS-only gate.
+evidence:
+  - "crates/firma-run/src/dns_stub/mod.rs:7"
+reachability: >
+  Directly reachable if an implementer copied host.rs's existing gate without widening it.
+invariant_or_boundary: INV-001 (Slice 7 would become a silent no-op on the only platform Hakoniwa
+  runs on).
+impact: Slice 7 would ship compiling and testing clean, yet do nothing on Linux.
+correction: State the new type needs a Linux-inclusive (or plain unix) cfg gate, distinct from
+  host.rs's macOS-only one.
+confidence: high
+assumptions: []
+```
+
+```yaml
+disposition:
+  status: superseded
+  rationale: >
+    Correct against the relay design (a new HakoniwaDnsResponderHandle type) it reviewed, adopted
+    in-place first. That type no longer exists in the accepted design -- DEC-012's
+    bind-before-capability-drop/fd-inheritance approach adds no new host-side type at all, only two
+    additive fields on the existing, already-correctly-gated DnsStubInput/DnsStubArgs.
+  incorporated_at: Not applicable to the accepted design
+  decided_by: planner
+```
+
+```yaml
+id: PLAN-012
+severity: medium
+category: security-posture tradeoff, previously undiscussed
+classification: confirmed-conflict
+claim: >
+  Writing ip_unprivileged_port_start=0 is per-network-namespace, not per-process -- the sandboxed
+  wrapped command itself, sharing that same netns, also gains ambient ability to bind ports 0-1023
+  with no capabilities, not just the intended relay. The plan framed this purely as a functional/
+  best-effort concern and never analyzed it as a security tradeoff.
+evidence:
+  - "Linux namespace semantics: net.ipv4.ip_unprivileged_port_start is namespace-scoped, not
+    process-scoped"
+reachability: >
+  Reachable for the whole lifetime of any Hakoniwa sandbox once this write lands, for any wrapped
+  command, not a narrow edge case.
+invariant_or_boundary: INV-001 (network confinement) -- adjacent to, not squarely inside, its
+  stated egress-only predicate, which is exactly why it went undiscussed.
+impact: >
+  A genuine, if likely low-exploitability given INV-001's actual egress-only scope, widening of the
+  untrusted wrapped command's own local capabilities, with no prior discussion or accepted
+  rationale in the plan.
+correction: >
+  Either add explicit reasoning for why the widening is acceptable, or design a narrower
+  alternative (e.g. pre-binding the relay's socket before capability drop and passing the fd across
+  exec instead of lowering the namespace-wide floor).
+confidence: medium
+assumptions: []
+```
+
+```yaml
+disposition:
+  status: corrected
+  rationale: >
+    User explicitly selected the narrower alternative the finding itself named as the fallback
+    option. Investigating that alternative empirically found it works cleanly (a direct
+    UdpSocket::bind("127.0.0.1:53") inside the closure, right after bring_up_loopback() succeeds,
+    binds with no sysctl or capability change at all -- confirmed by a temporary, reverted probe;
+    fd-inheritance across exec independently confirmed via a from-scratch two-binary reproduction).
+    This became the accepted design (DEC-012, rewritten), which touches nothing about the sandbox's
+    own network namespace configuration -- the finding's own concern is fully closed, not merely
+    mitigated.
+  incorporated_at: "DEC-012 (rewritten in full); Slice 7 (rewritten in full); PROOF-001's extended
+    row"
+  decided_by: user (explicit selection between "accept and document" vs. "design the narrower fix"
+    when presented with the tradeoff)
+```
+
+```yaml
+id: PLAN-013
+severity: medium
+category: durable-locator accuracy
+classification: confirmed-conflict
+claim: >
+  DEC-012 asserted BwrapBackend's identical bug needs "a new, host-side helper process... a
+  materially larger, separate mechanism" and said this was "tracked in
+  ~/Sources/openfirma-notes/todo/pending.md" -- but the actual tracked entry there described one
+  unified fix applying to both BwrapBackend and HakoniwaBackend, with no mention of the larger,
+  separate mechanism DEC-012 said BwrapBackend actually needs.
+evidence:
+  - "~/Sources/openfirma-notes/todo/pending.md (pre-correction entry)"
+  - "docs/architecture/hakoniwa-backend-plan.md's own DEC-012 text"
+reachability: >
+  Directly reachable: anyone reading only the tracked TODO would believe the same simple fix
+  applies to BwrapBackend.
+invariant_or_boundary: Not applicable (documentation consistency, not a code defect).
+impact: >
+  A future implementer picking up the tracked TODO could rediscover, the hard way, that bwrap's
+  capability drop happens earlier than Hakoniwa's.
+correction: Update pending.md's entry (or add a cross-reference to DEC-012) to reflect the actual,
+  larger BwrapBackend-specific mechanism needed.
+confidence: high
+assumptions: []
+```
+
+```yaml
+disposition:
+  status: corrected
+  rationale: >
+    Direct accuracy fix, adopted as suggested, independent of the later DEC-012 redesign (the
+    BwrapBackend-vs-Hakoniwa asymmetry this finding is about is unchanged by that redesign).
+  incorporated_at: "~/Sources/openfirma-notes/todo/pending.md's own entry, rewritten to distinguish
+    HakoniwaBackend's (planned, DEC-012) fix from BwrapBackend's (undesigned, larger) one"
+  decided_by: planner
+```
+
+```yaml
+id: PLAN-014
+severity: low
+category: mechanical implementation detail
+classification: confirmed-conflict
+claim: >
+  crates/firma/src/args/run.rs:152's DnsStubArgs derives Copy; adding an Option<PathBuf> field (not
+  Copy) breaks that derive, which the plan's "gains an additive field" framing did not mention.
+evidence:
+  - "crates/firma/src/args/run.rs:152"
+reachability: Mechanical -- would surface as a compile error during implementation.
+invariant_or_boundary: Not applicable.
+impact: Trivial, but worth noting so the plan's own framing doesn't imply zero-friction.
+correction: Note that Copy must be dropped from DnsStubArgs's derive list.
+confidence: high
+assumptions: []
+```
+
+```yaml
+disposition:
+  status: superseded
+  rationale: >
+    Corrected during implementation: the redesigned DnsStubArgs fields are Option<i32> fd numbers,
+    not Option<PathBuf> -- Option<i32> *is* Copy (i32 is Copy), so this specific concern does not
+    apply to the accepted design after all. DnsStubArgs keeps its Copy derive unchanged. Recorded
+    as superseded, not corrected, since the finding's own premise (the new fields break Copy)
+    turned out to be factually wrong once the exact field types were implemented, not merely
+    resolved by a code change.
+  incorporated_at: "crates/firma/src/args/run.rs's DnsStubArgs -- Copy derive kept, two new
+    Option<i32> fields added"
+  decided_by: planner
+```
+
+All five findings from this round are reflected in the current `DEC-012`/`INV-001`
+extension/Slice 7 prose, not just this disposition log. `PLAN-012` is the pivotal finding: it did
+not merely get "corrected" in place — investigating its own named fallback alternative changed the
+accepted design's entire mechanism, which is why `PLAN-010`/`PLAN-011` (both valid critiques of the
+design that finding's investigation superseded) are marked `superseded` rather than `corrected`.
+
+### Second review round — `DEC-012`/Slice 7 (the redesigned fd-inheritance mechanism)
+
+Independent review of the CURRENT `DEC-012`/`Slice 7` text only (a fresh reviewer, no access to
+this plan's authoring rationale, explicitly told not to re-review the superseded relay design
+already disposed of above). Confirmed the working tree was clean of the temporary probes this
+design's own Rationale cites (`git status`/`git diff` on `main.rs` and `dns_stub/mod.rs`). New
+findings numbered `PLAN-015` through `PLAN-022` (continuing after the first round's `PLAN-014`).
+
+The reviewer's summary judgment: "The core mechanism... is sound and correctly reasoned... this
+exact clear-CLOEXEC-then-inherit pattern is already shipping today for `BwrapBackend`'s seccomp fd
+(`linux_bwrap/mod.rs::clear_fd_cloexec`). No confirmed security-posture regression was found...
+and the plan's own claim that 'the sandbox's network namespace configuration is completely
+untouched' holds up against the code as it stands." All eight findings below are implementation-trap
+or completeness gaps, not fundamental design flaws.
+
+```yaml
+id: PLAN-015
+severity: medium
+category: lint-compliance
+classification: confirmed-conflict
+claim: >
+  dns_stub/mod.rs has no existing unsafe code and no module-level allowance; firma-run's
+  Cargo.toml inherits the workspace's unsafe_code = "warn" lint, promoted to a hard failure under
+  just lint/CI. The plan's new `unsafe { FromRawFd::from_raw_fd(fd) }` call needed an explicit
+  #![expect(unsafe_code, reason = "...")] (or fn-scoped equivalent), matching this crate's own
+  existing precedent (egress_guard.rs, execution_governance/ptrace_seccomp.rs), which the plan text
+  never mentioned.
+evidence:
+  - "crates/firma-run/Cargo.toml (no lint override); Cargo.toml:49 (workspace unsafe_code = warn)"
+  - "crates/firma-run/src/egress_guard.rs:53-56; execution_governance/ptrace_seccomp.rs:32-37"
+reachability: Certain -- surfaces the first time this code is implemented and CI runs.
+invariant_or_boundary: CLAUDE.md's unsafe_code deny policy.
+impact: Not a silent defect (CI catches it), but the plan should state the requirement explicitly.
+correction: State that dns_stub/mod.rs needs the expect-attribute, following the exact existing pattern.
+confidence: high
+assumptions: []
+```
+
+```yaml
+disposition:
+  status: corrected
+  rationale: Direct, evidence-backed addition.
+  incorporated_at: "Slice 7's execute_dns_stub program-design bullet"
+  decided_by: planner
+```
+
+```yaml
+id: PLAN-016
+severity: low
+category: unnecessary-unsafe / code-quality
+classification: design-risk
+claim: >
+  The plan specified clearing FD_CLOEXEC via a new raw libc::fcntl call, but
+  linux_bwrap/mod.rs:362-374's clear_fd_cloexec already does the identical thing safely via
+  nix::fcntl (no unsafe, no feature gate needed) for bwrap's own seccomp fd -- the same need, a
+  directly reusable idiom.
+evidence:
+  - "crates/firma-run/src/backend/linux_bwrap/mod.rs:362-374"
+  - "nix-0.31.3's fcntl module has no feature gate"
+reachability: Not applicable (design-quality choice, not a defect).
+invariant_or_boundary: unsafe_code minimization.
+impact: Cosmetic/consistency; firma-hakoniwa-runner already allows unsafe_code, so this wouldn't fail CI either way.
+correction: Mirror clear_fd_cloexec's own nix::fcntl-based approach locally rather than raw libc::fcntl.
+confidence: high
+assumptions: []
+```
+
+```yaml
+disposition:
+  status: corrected
+  rationale: Direct, evidence-backed improvement with an exact in-repo precedent to mirror.
+  incorporated_at: "Slice 7's closure program-design bullet"
+  decided_by: planner
+```
+
+```yaml
+id: PLAN-017
+severity: medium
+category: implementation trap (fd lifetime)
+classification: design-risk
+claim: >
+  The plan talked only about passing fd *numbers* onward, never stating that the owning
+  UdpSocket/TcpListener Rust values must themselves stay alive (not dropped) until after
+  spawn_dns_stub's Command::spawn() actually forks -- both types' Drop impls close the fd, so
+  dropping either socket value first silently closes the fd before inheritance can happen.
+evidence:
+  - "docs/architecture/hakoniwa-backend-plan.md's own pre-correction Slice 7 text"
+  - "crates/firma-hakoniwa-runner/src/main.rs:202-210 (the closure this extends)"
+reachability: Reachable if the socket values are scoped/dropped before the spawn() call.
+invariant_or_boundary: INV-001's Slice-7 extension -- the entire mechanism DEC-012 exists for.
+impact: >
+  If mishandled, silently regresses to a fd that's already closed by the time the child tries to
+  use it -- reintroducing exactly the bug this slice exists to close.
+correction: State explicitly that both sockets must remain in scope until after spawn_dns_stub's spawn() call.
+confidence: medium
+assumptions: []
+```
+
+```yaml
+disposition:
+  status: corrected
+  rationale: Direct, evidence-backed addition of a central correctness requirement.
+  incorporated_at: "Slice 7's closure program-design bullet"
+  decided_by: planner
+```
+
+```yaml
+id: PLAN-018
+severity: medium
+category: error-handling / robustness
+classification: confirmed-conflict
+claim: >
+  run_udp treats every recv_from error as non-fatal (log and loop forever), safe today only
+  because bind() either fully succeeds or execute_dns_stub fails fast beforehand. from_raw_fd
+  never validates the fd, so a bad inherited fd would not fail until first use inside an
+  already-detached thread, spinning and flooding logs indefinitely instead of terminating --
+  worse than today's clean bind failure.
+evidence:
+  - "crates/firma-run/src/dns_stub/mod.rs:52-62 (run_udp's unconditional loop-on-error)"
+reachability: Requires a bad inherited fd to reach execute_dns_stub (e.g. via PLAN-017's lifetime slip or PLAN-022's swap).
+invariant_or_boundary: INV-001's Slice-7 extension ("receives a real REFUSED response... not a hang/timeout").
+impact: A misconfigured inherited fd produces a silent, CPU-spinning, log-flooding stub -- worse than today's gap.
+correction: Validate the inherited fd (e.g. getsockopt(SO_TYPE)) before reconstructing the socket; fail closed on mismatch.
+confidence: medium
+assumptions: []
+```
+
+```yaml
+disposition:
+  status: corrected
+  rationale: Direct, evidence-backed robustness requirement, pairs naturally with PLAN-022's own fix.
+  incorporated_at: "Slice 7's execute_dns_stub program-design bullet"
+  decided_by: planner
+```
+
+```yaml
+id: PLAN-019
+severity: medium
+category: call-trace completeness
+classification: confirmed-conflict
+claim: >
+  Slice 7's call trace never mentioned crates/firma/src/services/dns_stub.rs::run, the actual
+  glue that today hardcodes DnsStubInput { listen: args.listen }. Because the new fields are
+  additive Options defaulting to None, the whole slice would compile, pass all existing tests, and
+  ship as a silent no-op for HakoniwaBackend if this file were left unchanged -- nothing forces a
+  compile error.
+evidence:
+  - "crates/firma/src/services/dns_stub.rs:14-22"
+reachability: Certain to be needed; silent-no-op risk if missed, since nothing forces a compile error.
+invariant_or_boundary: INV-001's Slice-7 extension.
+impact: Same class of risk as the first review round's PLAN-011 (silent no-op), reached via a different file.
+correction: Add this file to Slice 7's explicit call trace as a required edit.
+confidence: high
+assumptions: []
+```
+
+```yaml
+disposition:
+  status: corrected
+  rationale: Direct completeness gap, adopted as suggested.
+  incorporated_at: "Slice 7's program design (new bullet naming services/dns_stub.rs::run explicitly)"
+  decided_by: planner
+```
+
+```yaml
+id: PLAN-020
+severity: low
+category: proof-obligation quality (vacuous control)
+classification: design-risk
+claim: >
+  The listed "regression test confirming BwrapBackend's own call site is unchanged" cited
+  execute_dns_stub's existing unit tests, but none of them actually call execute_dns_stub itself
+  (they test the pure helper functions, untouched either way) -- their continuing to pass proves
+  nothing about the bind()-only branch still working.
+evidence:
+  - "crates/firma-run/src/dns_stub/mod.rs:139-313 (no test calls execute_dns_stub)"
+reachability: Not applicable (proof-quality gap, not a code defect).
+invariant_or_boundary: reviewing-plans' requirement for controls that rule out vacuous success.
+impact: The claimed regression control doesn't exercise the code path it claims to guard.
+correction: Add a real positive-control test calling execute_dns_stub with both new fields None, asserting it still binds args.listen.
+confidence: high
+assumptions: []
+```
+
+```yaml
+disposition:
+  status: corrected
+  rationale: Direct, evidence-backed test-quality fix.
+  incorporated_at: "Slice 7's Proof obligations list (replaces the vacuous bullet)"
+  decided_by: planner
+```
+
+```yaml
+id: PLAN-021
+severity: low
+category: unverified edge case
+classification: unverified-hypothesis
+claim: >
+  Nothing asserts the OS-assigned fd numbers for the new sockets are >2 (can't collide with
+  stdio) -- low-probability today (stdio stays open throughout this process's life), but no
+  defensive check exists if that assumption ever breaks.
+evidence:
+  - "crates/firma-hakoniwa-runner/src/main.rs:202-210 (no fd-number assertion anywhere)"
+reachability: Speculative; not reachable under the code as it exists today.
+invariant_or_boundary: Not applicable directly; general hygiene.
+impact: Low; would only manifest under an unrelated future change to this process's stdio handling.
+correction: Consider a defensive debug_assert!(fd > 2) when passing the fds onward.
+confidence: low
+assumptions: ["stdio remains open at this point in the process, as it does today"]
+```
+
+```yaml
+disposition:
+  status: acknowledged
+  rationale: >
+    Low confidence, speculative, and not reachable under current code. Noted in Slice 7's
+    "Intentionally unsupported" list rather than made a hard requirement.
+  incorporated_at: "Slice 7's Intentionally unsupported list"
+  decided_by: planner
+```
+
+```yaml
+id: PLAN-022
+severity: medium
+category: type-level modeling (same-typed swap)
+classification: design-risk
+claim: >
+  inherited_udp_fd/inherited_tcp_fd are both plain Option<RawFd> with no distinguishing type --
+  a compile-valid witness swaps them (DnsStubInput { inherited_udp_fd: Some(tcp_fd),
+  inherited_tcp_fd: Some(udp_fd), .. }) with no error. A swap produces an asymmetric, silent-until-
+  first-use failure (accept() on the wrong-typed fd fails loud; recv_from() on the other hits
+  PLAN-018's own spin-forever mode), with no test coverage for the swapped case.
+evidence:
+  - "docs/architecture/hakoniwa-backend-plan.md's own pre-correction Slice 7 program design"
+reachability: Reachable via an implementer's argument-ordering mistake; not attacker-triggered.
+invariant_or_boundary: INV-001's Slice-7 extension; reviewing-plans' same-typed-value-swap check.
+impact: A silent, asymmetric failure mode with no test coverage for the swapped case.
+correction: >
+  Add a runtime cross-check (getsockopt(SO_TYPE) on each fd before use -- pairs with PLAN-018) or a
+  unit test asserting a deliberately-swapped pair fails safely rather than silently misbehaving.
+confidence: medium
+assumptions: []
+```
+
+```yaml
+disposition:
+  status: corrected
+  rationale: >
+    Adopted the SO_TYPE validation (shared with PLAN-018's own fix) plus an explicit
+    deliberately-swapped-fd test, rather than a stronger newtype separation -- the validation
+    already closes the reachable failure mode without adding new wrapper types for two values
+    with no other behavioral difference.
+  incorporated_at: "Slice 7's execute_dns_stub program-design bullet; Proof obligations list (new
+    swapped-fd test)"
+  decided_by: planner
+```
+
+All eight findings from this round are reflected in the current `DEC-012`/Slice 7 prose. None
+rose to `critical` — the reviewer's own assessment confirmed the core bind-before-drop/fd-inheritance
+mechanism is sound, with an exact in-repo precedent (`clear_fd_cloexec`) already shipping the same
+idiom for `BwrapBackend`'s seccomp fd today.
+
 ## Final verification
 
 - Focused checks: per-slice verification as listed above.
@@ -677,19 +1485,19 @@ impl SandboxBackend for HakoniwaBackend {
 
 ### Conditional: Detailed proof obligations
 
-| Field                  | `PROOF-001` (`INV-001`)                                                                                                                                                                                                                                                                                                                                                    |
-| ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Kind                   | Runtime / Trust                                                                                                                                                                                                                                                                                                                                                            |
-| Owner/proof boundary   | `HakoniwaBackend`/runner binary                                                                                                                                                                                                                                                                                                                                            |
-| Suite/boundary         | E2E (Slices 1 and 3)                                                                                                                                                                                                                                                                                                                                                       |
-| Stimulus               | Sandboxed process attempts a direct connection to a non-loopback address, and separately, a loopback address that isn't a sanctioned Firma endpoint; separately (added after `PLAN-001`), the proxy-bridge process is killed mid-run, and separately, the sandbox attempts to read `FIRMA_RUN_SANDBOX_ID`/derive the outer session's runtime dir from an inherited env var |
-| Observable effects     | Connection attempts fail; sanctioned loopback endpoints (proxy bridge, DNS stub) remain reachable; a mid-run bridge death terminates the wrapped command (watchdog, `DEC-003`) rather than leaving it running unconfined; the sandboxed process observes no `FIRMA_RUN_*` env vars from the outer session (env-strip, `DEC-003`)                                           |
-| Controls/substitutions | Same fixture pattern as `tests/e2e/scenarios/child_process_governance/network.rs`, extended with a bridge-kill fixture and an env-inheritance assertion                                                                                                                                                                                                                    |
-| Failure cases          | Namespace/loopback-bringup misconfiguration → connectivity either over- or under-permissive; a dropped watchdog → sandboxed command survives an unconfined bridge death; a dropped env-strip → nested-run privilege-escalation path reopens                                                                                                                                |
-| Evidence               | New/parametrized e2e test (`DEC-011`)                                                                                                                                                                                                                                                                                                                                      |
-| Status                 | Planned                                                                                                                                                                                                                                                                                                                                                                    |
-| Slice                  | 1 (bare network-namespace case), 3 (loopback-bypass, watchdog, env-strip cases)                                                                                                                                                                                                                                                                                            |
-| Limits                 | Proves the specific stimuli tested; does not constitute the broader security audit `DEC-010` names as the actual sunset condition                                                                                                                                                                                                                                          |
+| Field                  | `PROOF-001` (`INV-001`)                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Kind                   | Runtime / Trust                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| Owner/proof boundary   | `HakoniwaBackend`/runner binary                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| Suite/boundary         | E2E (Slices 1 and 3)                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| Stimulus               | Sandboxed process attempts a direct connection to a non-loopback address, and separately, a loopback address that isn't a sanctioned Firma endpoint; separately (added after `PLAN-001`), the proxy-bridge process is killed mid-run, and separately, the sandbox attempts to read `FIRMA_RUN_SANDBOX_ID`/derive the outer session's runtime dir from an inherited env var; separately (`DEC-012`, Slice 7), the sandboxed process issues a DNS query against `127.0.0.1:53` |
+| Observable effects     | Connection attempts fail; sanctioned loopback endpoints (proxy bridge, DNS stub) remain reachable; a mid-run bridge death terminates the wrapped command (watchdog, `DEC-003`) rather than leaving it running unconfined; the sandboxed process observes no `FIRMA_RUN_*` env vars from the outer session (env-strip, `DEC-003`); the DNS query receives a real `REFUSED` response (`DEC-012`), not a hang/timeout from a silently-failed bind                               |
+| Controls/substitutions | Same fixture pattern as `tests/e2e/scenarios/child_process_governance/network.rs`, extended with a bridge-kill fixture, an env-inheritance assertion, and (`DEC-012`) a real DNS query issued from inside the sandbox                                                                                                                                                                                                                                                        |
+| Failure cases          | Namespace/loopback-bringup misconfiguration → connectivity either over- or under-permissive; a dropped watchdog → sandboxed command survives an unconfined bridge death; a dropped env-strip → nested-run privilege-escalation path reopens; a regression in the closure's pre-bind/fd-inheritance ordering → the DNS-stub bind failure silently returns                                                                                                                     |
+| Evidence               | New/parametrized e2e test (`DEC-011`); Slice 7's new e2e test for the DNS-stub inherited-fd path                                                                                                                                                                                                                                                                                                                                                                             |
+| Status                 | Planned (Slice 7's own portion not yet implemented)                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| Slice                  | 1 (bare network-namespace case), 3 (loopback-bypass, watchdog, env-strip cases), 7 (DNS-stub inherited-fd case)                                                                                                                                                                                                                                                                                                                                                              |
+| Limits                 | Proves the specific stimuli tested; does not constitute the broader security audit `DEC-010` names as the actual sunset condition                                                                                                                                                                                                                                                                                                                                            |
 
 | Field                  | `PROOF-002` (`INV-002`)                                                                                                                              |
 | ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |

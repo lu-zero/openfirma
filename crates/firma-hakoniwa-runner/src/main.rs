@@ -10,6 +10,7 @@
 //! env-strip sequence natively (Slice 3, `DEC-003`).
 
 use std::collections::BTreeMap;
+use std::net::{TcpListener, UdpSocket};
 use std::os::fd::AsRawFd as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
@@ -20,6 +21,7 @@ use clap::Parser;
 use hakoniwa::landlock::{CompatMode, FsAccess, Resource, Ruleset};
 use hakoniwa::seccomp::{Action, Arch, Filter};
 use hakoniwa::{Container, Namespace, Runctl};
+use nix::fcntl::{FcntlArg, FdFlag, fcntl};
 use serde::{Deserialize, Serialize};
 
 /// Version of the on-disk launch-contract schema this binary understands.
@@ -201,7 +203,22 @@ fn run(contract_path: &Path) -> Result<i32, RunnerError> {
     // backend.
     let mut command = unsafe {
         container.command_from_closure(move || match bring_up_loopback() {
-            Ok(()) => run_entrypoint_orchestration(&contract),
+            Ok(()) => {
+                // Bind the DNS-stub's own sockets here, immediately after
+                // `bring_up_loopback()` succeeds and before any subsequent
+                // `fork`+`exec` — confirmed empirically that this process
+                // still holds `CAP_NET_BIND_SERVICE` at this exact point,
+                // with no sysctl/capability change needed (`DEC-012`);
+                // everything spawned afterward (this same closure's own
+                // later `exec`s) does not retain it. `None` on any bind
+                // failure — best-effort, matching `spawn_dns_stub`'s own
+                // existing non-fatal framing.
+                let dns_stub_sockets = contract
+                    .env
+                    .get("FIRMA_RUN_DNS_STUB_LISTEN_ADDR")
+                    .and_then(|addr| bind_dns_stub_sockets(addr));
+                run_entrypoint_orchestration(&contract, dns_stub_sockets)
+            }
             Err(error) => {
                 eprintln!("firma-hakoniwa-runner: {error}");
                 125
@@ -460,20 +477,30 @@ fn exec_real_command(contract: &LaunchContract, env: &BTreeMap<String, String>) 
 /// that function's docs for why: a watchdog spawned from inside this
 /// function (i.e. inside the sandbox) cannot terminate the wrapped command,
 /// since Hakoniwa's `Container` makes it PID 1 in its own PID namespace.
-fn run_entrypoint_orchestration(contract: &LaunchContract) -> i32 {
+fn run_entrypoint_orchestration(
+    contract: &LaunchContract,
+    dns_stub_sockets: Option<(UdpSocket, TcpListener)>,
+) -> i32 {
     let self_exe = contract.env.get("FIRMA_RUN_SELF_EXE").cloned();
     let runtime_dir = contract.env.get("FIRMA_RUN_RUNTIME_DIR").cloned();
 
     if let Some(self_exe) = &self_exe
-        && let Some(listen_addr) = contract.env.get("FIRMA_RUN_DNS_STUB_LISTEN_ADDR")
+        && let Some((udp, tcp)) = dns_stub_sockets
     {
         // Best-effort: DNS resolution failing is not fatal to the sandbox,
         // matching `bwrap_entrypoint.sh`'s own non-fatal treatment. The
         // spawned child is intentionally not retained — `Child`'s `Drop`
         // does not kill it, so it keeps running detached in the background
         // for the sandbox's lifetime, same as the shell script's own
-        // backgrounded `dns_pid`.
-        let _ = spawn_dns_stub(self_exe, &contract.env, listen_addr);
+        // backgrounded `dns_pid`. `spawn_dns_stub` takes ownership of
+        // `udp`/`tcp` and drops them once it returns (`DEC-012`) — after
+        // its own `Command::spawn()` has already forked, so the dns-stub
+        // child's independently-inherited copies of these fds stay open,
+        // but this process's own copies do not survive into any later
+        // `exec` it performs itself (the proxy bridge, `egress-guarded-run`,
+        // or the final wrapped command) — none of those should ever hold
+        // an open handle to the DNS stub's own listening sockets.
+        let _ = spawn_dns_stub(self_exe, &contract.env, udp, tcp);
     }
 
     let bridge = match (
@@ -540,7 +567,64 @@ fn run_entrypoint_orchestration(contract: &LaunchContract) -> i32 {
     exec_real_command(contract, &stripped_env)
 }
 
-/// Starts `firma __dns-stub --listen <listen_addr>`.
+/// Binds the DNS-stub's UDP/TCP listen sockets directly, before this
+/// process's own capabilities are lost at the next `fork`+`exec` boundary
+/// (`DEC-012` in `docs/architecture/hakoniwa-backend-plan.md`) — confirmed
+/// empirically that a direct bind here succeeds with no sysctl/capability
+/// change needed, since this runs before any `exec` crosses that boundary,
+/// the same timing `bring_up_loopback` itself already relies on. Clears
+/// `FD_CLOEXEC` on both so [`spawn_dns_stub`]'s later `Command::spawn()`
+/// can pass them to the `firma __dns-stub` child across `exec`.
+///
+/// Best-effort: returns `None` (logged) on any bind or `fcntl` failure,
+/// matching [`spawn_dns_stub`]'s own established non-fatal framing — a
+/// failure here only means the sandboxed process loses DNS resolution
+/// through the stub, not that the whole sandbox launch fails.
+fn bind_dns_stub_sockets(listen_addr: &str) -> Option<(UdpSocket, TcpListener)> {
+    let udp = UdpSocket::bind(listen_addr)
+        .inspect_err(|error| {
+            eprintln!(
+                "firma-hakoniwa-runner: failed to bind DNS UDP stub at {listen_addr}: {error}"
+            );
+        })
+        .ok()?;
+    let tcp = TcpListener::bind(listen_addr)
+        .inspect_err(|error| {
+            eprintln!(
+                "firma-hakoniwa-runner: failed to bind DNS TCP stub at {listen_addr}: {error}"
+            );
+        })
+        .ok()?;
+    clear_fd_cloexec(&udp)
+        .inspect_err(|error| eprintln!("firma-hakoniwa-runner: {error}"))
+        .ok()?;
+    clear_fd_cloexec(&tcp)
+        .inspect_err(|error| eprintln!("firma-hakoniwa-runner: {error}"))
+        .ok()?;
+    Some((udp, tcp))
+}
+
+/// Clears `FD_CLOEXEC` on `fd` so it survives a subsequent `exec`, mirroring
+/// `crates/firma-run/src/backend/linux_bwrap/mod.rs`'s own
+/// `clear_fd_cloexec` (used there for bwrap's seccomp fd) — duplicated
+/// rather than shared, since `firma-hakoniwa-runner` does not depend on
+/// `firma-run` (a separate binary crate, `DEC-001`).
+fn clear_fd_cloexec<Fd: std::os::fd::AsFd>(fd: &Fd) -> Result<(), RunnerError> {
+    let flags = fcntl(fd, FcntlArg::F_GETFD)
+        .map_err(|error| RunnerError::Loopback(format!("failed to read fd flags: {error}")))?;
+    let mut fd_flags = FdFlag::from_bits_truncate(flags);
+    fd_flags.remove(FdFlag::FD_CLOEXEC);
+    fcntl(fd, FcntlArg::F_SETFD(fd_flags)).map_err(|error| {
+        RunnerError::Loopback(format!("failed to clear CLOEXEC on fd: {error}"))
+    })?;
+    Ok(())
+}
+
+/// Starts `firma __dns-stub --inherited-udp-fd <n> --inherited-tcp-fd <n>`,
+/// passing `udp`/`tcp` — already bound at `FIRMA_RUN_DNS_STUB_LISTEN_ADDR`
+/// by [`bind_dns_stub_sockets`] before this process's own capability drop
+/// — across `exec` rather than having the child bind them itself
+/// (`DEC-012`).
 ///
 /// Best-effort, mirroring `bwrap_entrypoint.sh`: a failed or crashed stub
 /// does not fail the sandbox launch, since the sandboxed process still has a
@@ -548,15 +632,31 @@ fn run_entrypoint_orchestration(contract: &LaunchContract) -> i32 {
 /// unshared) — it only loses DNS resolution through the stub. Returns the
 /// spawned child on success so the caller can deliberately leak it (see
 /// [`run_entrypoint_orchestration`]); returns `None` and logs otherwise.
+///
+/// Takes `udp`/`tcp` by value and lets them drop at the end of this
+/// function, once `Command::spawn()` has already forked — the child's own,
+/// independently-inherited copies of these fds stay open regardless; this
+/// process's own copies must not survive into whatever it `exec`s into
+/// next (see [`run_entrypoint_orchestration`]'s own doc comment).
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "by-value is deliberate, not incidental: udp/tcp must stay alive (not be dropped by \
+              an earlier-returning caller) until after Command::spawn() below has forked, then be \
+              dropped by this function itself so this process's own copies don't survive into a \
+              later exec (DEC-012) — a reference would let the caller drop them at the wrong time"
+)]
 fn spawn_dns_stub(
     self_exe: &str,
     env: &BTreeMap<String, String>,
-    listen_addr: &str,
+    udp: UdpSocket,
+    tcp: TcpListener,
 ) -> Option<std::process::Child> {
     let mut child = std::process::Command::new(self_exe)
         .arg("__dns-stub")
-        .arg("--listen")
-        .arg(listen_addr)
+        .arg("--inherited-udp-fd")
+        .arg(udp.as_raw_fd().to_string())
+        .arg("--inherited-tcp-fd")
+        .arg(tcp.as_raw_fd().to_string())
         .env_clear()
         .envs(env)
         .spawn()

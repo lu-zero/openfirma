@@ -1,6 +1,10 @@
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::os::fd::{FromRawFd, RawFd};
 use std::thread;
+
+use nix::sys::socket::SockType;
+use nix::sys::socket::sockopt::SockType as SockTypeOpt;
 
 use crate::error::RunError;
 
@@ -12,7 +16,17 @@ pub(crate) mod host;
 #[derive(Debug, Clone)]
 pub struct DnsStubInput {
     /// UDP/TCP DNS listen address reachable by the sandboxed agent process.
+    /// Ignored when [`Self::inherited_udp_fd`]/[`Self::inherited_tcp_fd`]
+    /// are both set.
     pub listen: SocketAddr,
+    /// A UDP socket already bound (at `listen`) and inherited across
+    /// `exec` from a trusted parent process — `HakoniwaBackend` only, see
+    /// `DEC-012` in `docs/architecture/hakoniwa-backend-plan.md`. Must be
+    /// set together with [`Self::inherited_tcp_fd`] or not at all;
+    /// [`execute_dns_stub`] rejects the mixed case rather than guessing.
+    pub inherited_udp_fd: Option<RawFd>,
+    /// As [`Self::inherited_udp_fd`], for the TCP listener.
+    pub inherited_tcp_fd: Option<RawFd>,
 }
 
 const DNS_HEADER_LEN: usize = 12;
@@ -26,20 +40,37 @@ const DNS_RCODE_REFUSED: u8 = 5;
 ///
 /// # Errors
 ///
-/// Returns an error if UDP or TCP DNS listeners cannot bind.
+/// Returns an error if UDP or TCP DNS listeners cannot bind (or, when
+/// `inherited_udp_fd`/`inherited_tcp_fd` are set, if either fd is not a
+/// valid socket of the expected type), or if exactly one of
+/// `inherited_udp_fd`/`inherited_tcp_fd` is set without the other.
 pub fn execute_dns_stub(args: &DnsStubInput) -> Result<i32, RunError> {
-    let udp = UdpSocket::bind(args.listen).map_err(|error| {
-        RunError::Spawn(format!(
-            "failed to bind sandbox DNS UDP stub at {}: {error}",
-            args.listen
-        ))
-    })?;
-    let tcp = TcpListener::bind(args.listen).map_err(|error| {
-        RunError::Spawn(format!(
-            "failed to bind sandbox DNS TCP stub at {}: {error}",
-            args.listen
-        ))
-    })?;
+    let (udp, tcp) = match (args.inherited_udp_fd, args.inherited_tcp_fd) {
+        (Some(udp_fd), Some(tcp_fd)) => (
+            inherited_udp_socket(udp_fd)?,
+            inherited_tcp_listener(tcp_fd)?,
+        ),
+        (None, None) => (
+            UdpSocket::bind(args.listen).map_err(|error| {
+                RunError::Spawn(format!(
+                    "failed to bind sandbox DNS UDP stub at {}: {error}",
+                    args.listen
+                ))
+            })?,
+            TcpListener::bind(args.listen).map_err(|error| {
+                RunError::Spawn(format!(
+                    "failed to bind sandbox DNS TCP stub at {}: {error}",
+                    args.listen
+                ))
+            })?,
+        ),
+        (udp_fd, tcp_fd) => {
+            return Err(RunError::Spawn(format!(
+                "DNS stub requires both --inherited-udp-fd and --inherited-tcp-fd together, \
+                 or neither; got udp={udp_fd:?} tcp={tcp_fd:?}"
+            )));
+        }
+    };
 
     thread::Builder::new()
         .name("firma-run-dns-udp".to_string())
@@ -47,6 +78,58 @@ pub fn execute_dns_stub(args: &DnsStubInput) -> Result<i32, RunError> {
         .map_err(|error| RunError::Spawn(format!("failed to spawn DNS UDP stub: {error}")))?;
 
     run_tcp(&tcp)
+}
+
+/// Reconstructs an already-bound `UdpSocket` from a fd inherited across
+/// `exec` (`DEC-012`), verifying it is actually a datagram socket before
+/// trusting it as one — a bare `RawFd` carries no type information, so a
+/// caller that accidentally passes the TCP listener's fd here (or any
+/// other fd) is rejected explicitly rather than silently misbehaving at
+/// first use.
+fn inherited_udp_socket(fd: RawFd) -> Result<UdpSocket, RunError> {
+    // SAFETY: `fd` is passed by firma-hakoniwa-runner, a trusted parent
+    // process, specifically as an already-open, already-bound socket
+    // inherited across `exec` for this purpose (`DEC-012`) — not
+    // attacker-controlled input. This process takes exclusive ownership;
+    // its actual socket type is verified immediately below, not assumed.
+    #[expect(
+        unsafe_code,
+        reason = "FromRawFd::from_raw_fd is the only way to reconstruct a socket \
+                  inherited across exec from a trusted parent process (DEC-012); \
+                  its validity and type are verified immediately below, not assumed"
+    )]
+    let socket = unsafe { UdpSocket::from_raw_fd(fd) };
+    match nix::sys::socket::getsockopt(&socket, SockTypeOpt) {
+        Ok(SockType::Datagram) => Ok(socket),
+        Ok(other) => Err(RunError::Spawn(format!(
+            "--inherited-udp-fd {fd} is not a datagram socket (got {other:?})"
+        ))),
+        Err(error) => Err(RunError::Spawn(format!(
+            "--inherited-udp-fd {fd} is not a valid socket: {error}"
+        ))),
+    }
+}
+
+/// As [`inherited_udp_socket`], for the TCP listener.
+fn inherited_tcp_listener(fd: RawFd) -> Result<TcpListener, RunError> {
+    // SAFETY: see `inherited_udp_socket` — same trusted-parent contract,
+    // same immediate type verification below.
+    #[expect(
+        unsafe_code,
+        reason = "FromRawFd::from_raw_fd is the only way to reconstruct a socket \
+                  inherited across exec from a trusted parent process (DEC-012); \
+                  its validity and type are verified immediately below, not assumed"
+    )]
+    let listener = unsafe { TcpListener::from_raw_fd(fd) };
+    match nix::sys::socket::getsockopt(&listener, SockTypeOpt) {
+        Ok(SockType::Stream) => Ok(listener),
+        Ok(other) => Err(RunError::Spawn(format!(
+            "--inherited-tcp-fd {fd} is not a stream socket (got {other:?})"
+        ))),
+        Err(error) => Err(RunError::Spawn(format!(
+            "--inherited-tcp-fd {fd} is not a valid socket: {error}"
+        ))),
+    }
 }
 
 fn run_udp(socket: &UdpSocket) {
@@ -131,9 +214,14 @@ fn refused_response(query: &[u8]) -> Option<Vec<u8>> {
 mod tests {
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream, UdpSocket};
+    use std::os::fd::IntoRawFd;
     use std::time::Duration;
 
-    use super::{DNS_RCODE_REFUSED, handle_tcp_client, host::HostDnsStubHandle, refused_response};
+    use super::{
+        DNS_RCODE_REFUSED, DnsStubInput, execute_dns_stub, handle_tcp_client,
+        host::HostDnsStubHandle, refused_response,
+    };
+    use crate::error::RunError;
 
     fn sample_query() -> Vec<u8> {
         vec![
@@ -233,6 +321,117 @@ mod tests {
             ),
             "unexpected read error: {error}"
         );
+    }
+
+    // ── execute_dns_stub ──────────────────────────────────────────────────────
+
+    /// `PLAN-020`: a real positive control for `BwrapBackend`'s own,
+    /// unmodified call site — asserts `execute_dns_stub` still binds
+    /// `listen` itself and serves real queries when neither inherited fd
+    /// is set, not just that unrelated helper-function tests keep passing.
+    #[test]
+    fn execute_dns_stub_binds_and_serves_when_no_fd_is_inherited() {
+        // Reserve a genuinely free ephemeral port via a throwaway bind,
+        // then release it immediately — execute_dns_stub binds `listen`
+        // itself and reports nothing back, so the test must know the
+        // address in advance.
+        let probe = TcpListener::bind("127.0.0.1:0").expect("reserve ephemeral port");
+        let listen = probe.local_addr().expect("addr");
+        drop(probe);
+
+        let input = DnsStubInput {
+            listen,
+            inherited_udp_fd: None,
+            inherited_tcp_fd: None,
+        };
+        std::thread::spawn(move || {
+            let _ = execute_dns_stub(&input);
+        });
+        std::thread::sleep(Duration::from_millis(100));
+
+        let client = UdpSocket::bind("127.0.0.1:0").expect("client bind");
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set timeout");
+        let query = sample_query();
+        client.send_to(&query, listen).expect("send query");
+        let mut buf = [0_u8; 512];
+        let (_, _) = client.recv_from(&mut buf).expect("recv response");
+        assert_eq!(&buf[..2], &[0xAB, 0xCD], "transaction id must be preserved");
+        assert_eq!(buf[3] & 0x0F, DNS_RCODE_REFUSED);
+    }
+
+    /// The inherited-fd path (`DEC-012`, `HakoniwaBackend` only) exercises
+    /// the exact same `refused_response`/`run_udp`/`run_tcp` logic as the
+    /// bind path — proven by constructing real sockets here (standing in
+    /// for `firma-hakoniwa-runner`'s own pre-bound ones) and passing only
+    /// their raw fd numbers, the same way production code would.
+    #[test]
+    fn execute_dns_stub_serves_over_inherited_fds() {
+        let udp = UdpSocket::bind("127.0.0.1:0").expect("bind udp");
+        let listen = udp.local_addr().expect("addr");
+        let tcp = TcpListener::bind(listen).expect("bind tcp on the same port");
+        let udp_fd = udp.into_raw_fd();
+        let tcp_fd = tcp.into_raw_fd();
+
+        let input = DnsStubInput {
+            listen: "127.0.0.1:0".parse().expect("unused placeholder addr"),
+            inherited_udp_fd: Some(udp_fd),
+            inherited_tcp_fd: Some(tcp_fd),
+        };
+        std::thread::spawn(move || {
+            let _ = execute_dns_stub(&input);
+        });
+        std::thread::sleep(Duration::from_millis(100));
+
+        let client = UdpSocket::bind("127.0.0.1:0").expect("client bind");
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set timeout");
+        let query = sample_query();
+        client.send_to(&query, listen).expect("send query");
+        let mut buf = [0_u8; 512];
+        let (_, _) = client.recv_from(&mut buf).expect("recv response");
+        assert_eq!(&buf[..2], &[0xAB, 0xCD], "transaction id must be preserved");
+        assert_eq!(buf[3] & 0x0F, DNS_RCODE_REFUSED);
+    }
+
+    /// `PLAN-022`: a swapped fd pair (the UDP-shaped argument actually
+    /// pointing at the TCP listener's fd, and vice versa) must be rejected
+    /// deterministically, not silently misbehave — both fds are real,
+    /// valid sockets, just the wrong type for the argument they're passed
+    /// as, so only the `SO_TYPE` check (not fd validity) can catch this.
+    #[test]
+    fn execute_dns_stub_rejects_a_swapped_fd_pair() {
+        let udp = UdpSocket::bind("127.0.0.1:0").expect("bind udp");
+        let listen = udp.local_addr().expect("addr");
+        let tcp = TcpListener::bind(listen).expect("bind tcp on the same port");
+        let udp_fd = udp.into_raw_fd();
+        let tcp_fd = tcp.into_raw_fd();
+
+        let input = DnsStubInput {
+            listen: "127.0.0.1:0".parse().expect("unused placeholder addr"),
+            inherited_udp_fd: Some(tcp_fd),
+            inherited_tcp_fd: Some(udp_fd),
+        };
+        let error = execute_dns_stub(&input).expect_err("a swapped fd pair must be rejected");
+        assert!(matches!(error, RunError::Spawn(_)));
+    }
+
+    /// Exactly one of the two inherited-fd arguments being set is treated
+    /// as a caller error, not a fallback to binding — mixing "inherit one,
+    /// bind the other" would leave the DNS stub in an inconsistent,
+    /// untested configuration.
+    #[test]
+    fn execute_dns_stub_rejects_exactly_one_inherited_fd_being_set() {
+        let input = DnsStubInput {
+            listen: "127.0.0.1:0".parse().expect("unused placeholder addr"),
+            inherited_udp_fd: Some(3),
+            inherited_tcp_fd: None,
+        };
+        let error =
+            execute_dns_stub(&input).expect_err("exactly one inherited fd must be rejected");
+        assert!(matches!(error, RunError::Spawn(_)));
     }
 
     // ── HostDnsStubHandle ─────────────────────────────────────────────────────

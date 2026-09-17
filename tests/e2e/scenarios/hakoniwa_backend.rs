@@ -161,6 +161,192 @@ fn hakoniwa_backend_blocks_network_like_bwrap() {
     );
 }
 
+/// Sends one well-formed DNS query over UDP to `127.0.0.1:53` and reports its
+/// outcome — `CHILD DNS RESPONSE RCODE=<n> TXN_ID_OK=<bool>` on a reply
+/// received within 5s, `CHILD DNS NO RESPONSE` on a timeout. Exits 0 only
+/// when the reply is a `REFUSED` (RCODE 5) response to this exact query
+/// (transaction ID echoed back) — this is `DEC-012`'s own observable
+/// capability: `Slice 3`'s DNS-stub bootstrap silently failed to bind port
+/// 53 until `Slice 7` closed that gap.
+const DNS_RESOLUTION_SCRIPT: &str = r#"
+python3 - <<'PYEOF'
+import socket
+import sys
+
+query = bytes([0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]) \
+    + bytes([7]) + b"example" + bytes([3]) + b"com" + bytes([0, 0, 1, 0, 1])
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.settimeout(5)
+sock.sendto(query, ("127.0.0.1", 53))
+try:
+    data, _ = sock.recvfrom(512)
+except socket.timeout:
+    print("CHILD DNS NO RESPONSE")
+    sys.exit(1)
+
+rcode = data[3] & 0x0F
+txn_id_ok = data[0:2] == query[0:2]
+print(f"CHILD DNS RESPONSE RCODE={rcode} TXN_ID_OK={txn_id_ok}")
+sys.exit(0 if rcode == 5 and txn_id_ok else 2)
+PYEOF
+"#;
+
+/// `DEC-012`/Slice 7 of `docs/architecture/hakoniwa-backend-plan.md`.
+///
+/// Proves the sandbox's DNS stub actually answers real queries end to end
+/// under a real `firma run --backend hakoniwa` invocation — the first test
+/// anywhere to assert this for `HakoniwaBackend` (Slice 3's own
+/// `hakoniwa_backend_blocks_network_like_bwrap` only proves namespace-level
+/// network confinement, not that the sanctioned loopback DNS-stub route
+/// itself works). Before `DEC-012`, this same query would time out (`CHILD
+/// DNS NO RESPONSE`): the stub silently failed to bind `127.0.0.1:53`
+/// inside the sandbox's own network namespace.
+#[test]
+fn hakoniwa_backend_dns_stub_answers_real_queries() {
+    let Some(runner) = hakoniwa_runner_path() else {
+        eprintln!(
+            "skipping hakoniwa_backend_dns_stub_answers_real_queries: firma-hakoniwa-runner was \
+             not built (run `cargo build --workspace` or `cargo nextest run` without `-p` to \
+             build it)"
+        );
+        return;
+    };
+    let bash = first_existing(&["/usr/bin/bash", "/bin/bash"])
+        .unwrap_or_else(|| panic!("bash must be installed in the test environment"));
+    let python3 = first_existing(&["/usr/bin/python3", "/bin/python3"]);
+    if python3.is_none() {
+        eprintln!(
+            "skipping hakoniwa_backend_dns_stub_answers_real_queries: python3 was not found on \
+             this host"
+        );
+        return;
+    }
+
+    let world = TestWorld::isolated();
+    let cfg_dir = world.path("config");
+    let state_dir = world.state_path();
+    let workspace = world.workspace_path();
+
+    world.scaffold_config(
+        "generic",
+        &cfg_dir,
+        &state_dir,
+        Some(&workspace),
+        &workspace,
+    );
+    let config_path = cfg_dir.join("firma.toml");
+    patch_backend_to_hakoniwa(&config_path);
+
+    let mut command = world.isolated_command_in(env!("CARGO_BIN_EXE_firma"), &workspace);
+    command
+        .env("FIRMA_RUN_HAKONIWA_RUNNER", &runner)
+        .args(["run", "--profile", "generic", "--config"])
+        .arg(&config_path)
+        .args(["--sidecar", "local", "--authority", "local", "--"])
+        .arg(&bash)
+        .arg("-c")
+        .arg(DNS_RESOLUTION_SCRIPT);
+    let output = run_bounded(&mut command, Duration::from_mins(2));
+
+    assert!(
+        output.success(),
+        "hakoniwa-backed DNS query did not succeed:\n{output}"
+    );
+    assert!(
+        output
+            .stdout
+            .contains("CHILD DNS RESPONSE RCODE=5 TXN_ID_OK=True"),
+        "hakoniwa-backed run did not observe a REFUSED response to its own query:\n{output}"
+    );
+}
+
+/// Tries to bind `127.0.0.1:80` (a privileged port unrelated to the DNS
+/// stub) and reports the outcome — `CHILD BIND OK` or `CHILD BIND
+/// FAILED: <errno>`.
+const UNRELATED_PRIVILEGED_PORT_BIND_SCRIPT: &str = r#"
+python3 -c "
+import socket
+import sys
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+try:
+    sock.bind(('127.0.0.1', 80))
+    print('CHILD BIND OK')
+    sys.exit(0)
+except OSError as e:
+    print(f'CHILD BIND FAILED: {e}')
+    sys.exit(1)
+"
+"#;
+
+/// `DEC-012`'s own design point, required by Slice 7's proof-obligation
+/// list: the accepted fd-inheritance fix must not widen the sandbox's own
+/// network namespace configuration for anything *other* than the two
+/// sockets it explicitly binds and hands over — unlike the earlier,
+/// rejected design (lowering `ip_unprivileged_port_start` to 0 for the
+/// whole netns), which would have let the wrapped command bind *any*
+/// privileged port, not just port 53. Asserts the wrapped command still
+/// cannot bind an unrelated privileged port (80) — proving that rejected
+/// widening did not happen.
+#[test]
+fn hakoniwa_backend_wrapped_command_cannot_bind_an_unrelated_privileged_port() {
+    let Some(runner) = hakoniwa_runner_path() else {
+        eprintln!(
+            "skipping hakoniwa_backend_wrapped_command_cannot_bind_an_unrelated_privileged_port: \
+             firma-hakoniwa-runner was not built (run `cargo build --workspace` or `cargo \
+             nextest run` without `-p` to build it)"
+        );
+        return;
+    };
+    let bash = first_existing(&["/usr/bin/bash", "/bin/bash"])
+        .unwrap_or_else(|| panic!("bash must be installed in the test environment"));
+    let python3 = first_existing(&["/usr/bin/python3", "/bin/python3"]);
+    if python3.is_none() {
+        eprintln!(
+            "skipping hakoniwa_backend_wrapped_command_cannot_bind_an_unrelated_privileged_port: \
+             python3 was not found on this host"
+        );
+        return;
+    }
+
+    let world = TestWorld::isolated();
+    let cfg_dir = world.path("config");
+    let state_dir = world.state_path();
+    let workspace = world.workspace_path();
+
+    world.scaffold_config(
+        "generic",
+        &cfg_dir,
+        &state_dir,
+        Some(&workspace),
+        &workspace,
+    );
+    let config_path = cfg_dir.join("firma.toml");
+    patch_backend_to_hakoniwa(&config_path);
+
+    let mut command = world.isolated_command_in(env!("CARGO_BIN_EXE_firma"), &workspace);
+    command
+        .env("FIRMA_RUN_HAKONIWA_RUNNER", &runner)
+        .args(["run", "--profile", "generic", "--config"])
+        .arg(&config_path)
+        .args(["--sidecar", "local", "--authority", "local", "--"])
+        .arg(&bash)
+        .arg("-c")
+        .arg(UNRELATED_PRIVILEGED_PORT_BIND_SCRIPT);
+    let output = run_bounded(&mut command, Duration::from_mins(2));
+
+    assert!(
+        !output.success(),
+        "the wrapped command unexpectedly bound an unrelated privileged port (80) -- the \
+         DEC-012 fix must not widen the sandbox's own network namespace configuration:\n{output}"
+    );
+    assert!(
+        output.stdout.contains("CHILD BIND FAILED"),
+        "the wrapped command did not report the expected bind failure:\n{output}"
+    );
+}
+
 /// Patches a scaffolded `firma.toml`'s generic profile to use the experimental Hakoniwa backend.
 ///
 /// Fails loudly if the generated profile no longer has the expected anchor, rather than silently

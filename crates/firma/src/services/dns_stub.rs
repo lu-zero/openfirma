@@ -14,6 +14,8 @@ use crate::args::run::DnsStubArgs;
 pub fn run(args: DnsStubArgs) -> anyhow::Result<ExitCode> {
     let input = DnsStubInput {
         listen: args.listen,
+        inherited_udp_fd: args.inherited_udp_fd,
+        inherited_tcp_fd: args.inherited_tcp_fd,
     };
     match execute_dns_stub(&input) {
         Ok(code) => Ok(exit_code(code)),

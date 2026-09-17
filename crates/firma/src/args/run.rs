@@ -152,8 +152,20 @@ pub struct ExecGuardedRunArgs {
 #[derive(Debug, Clone, Copy, Args)]
 pub struct DnsStubArgs {
     /// UDP/TCP DNS listen address reachable by the sandboxed agent process.
+    /// Ignored when both `--inherited-udp-fd`/`--inherited-tcp-fd` are set.
     #[arg(long, default_value = "127.0.0.1:53")]
     pub listen: SocketAddr,
+
+    /// An already-bound UDP socket's fd, inherited across `exec` from a
+    /// trusted parent process (`HakoniwaBackend` only — see `DEC-012` in
+    /// `docs/architecture/hakoniwa-backend-plan.md`). Must be set together
+    /// with `--inherited-tcp-fd` or not at all.
+    #[arg(long)]
+    pub inherited_udp_fd: Option<i32>,
+
+    /// As `--inherited-udp-fd`, for the TCP listener.
+    #[arg(long)]
+    pub inherited_tcp_fd: Option<i32>,
 }
 
 /// User-facing backend override values.
