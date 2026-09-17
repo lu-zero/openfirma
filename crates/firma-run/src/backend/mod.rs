@@ -1,4 +1,5 @@
 mod firecracker;
+mod hakoniwa;
 /// Exposed for the crate's integration tests, which exercise the bwrap mount
 /// planner's parsing of the host mount table. Not part of any supported API.
 #[doc(hidden)]
@@ -45,6 +46,7 @@ pub enum NetworkConfinement {
 }
 
 pub use firecracker::FirecrackerBackend;
+pub use hakoniwa::HakoniwaBackend;
 pub use linux_bwrap::BwrapBackend;
 pub use macos_vz::VzBackend;
 pub use windows_wsl2::Wsl2Backend;
@@ -87,6 +89,11 @@ pub enum BackendKind {
     Vz,
     Wsl2,
     Firecracker,
+    /// Embeds the `hakoniwa` sandboxing library via a sibling launcher binary
+    /// instead of shelling out to an external binary. Experimental — never a
+    /// platform default; opt-in only via explicit `--backend`/`backend =`.
+    /// See `docs/architecture/hakoniwa-backend-plan.md`.
+    Hakoniwa,
 }
 
 impl BackendKind {
@@ -127,6 +134,7 @@ impl fmt::Display for BackendKind {
             Self::Vz => "vz",
             Self::Wsl2 => "wsl2",
             Self::Firecracker => "firecracker",
+            Self::Hakoniwa => "hakoniwa",
         };
         write!(f, "{text}")
     }
@@ -141,8 +149,9 @@ impl std::str::FromStr for BackendKind {
             "vz" => Ok(Self::Vz),
             "wsl2" => Ok(Self::Wsl2),
             "firecracker" => Ok(Self::Firecracker),
+            "hakoniwa" => Ok(Self::Hakoniwa),
             other => Err(format!(
-                "unsupported backend '{other}'; expected one of: bwrap, vz, wsl2, firecracker"
+                "unsupported backend '{other}'; expected one of: bwrap, vz, wsl2, firecracker, hakoniwa"
             )),
         }
     }
@@ -335,6 +344,32 @@ pub struct LaunchSpec {
         expect(dead_code, reason = "seccomp is consumed only by the Linux backend")
     )]
     pub(crate) seccomp_filter_path: Option<PathBuf>,
+    /// Syscall names denied by the profile's `deny_actions` policy, resolved
+    /// without compiling a BPF artifact.
+    ///
+    /// `None` when no seccomp policy is configured. Consumed only by
+    /// `HakoniwaBackend`, which builds a `hakoniwa::seccomp::Filter` directly
+    /// from these names instead of loading `seccomp_filter_path`'s static
+    /// cBPF artifact — see `docs/architecture/hakoniwa-backend-plan.md`,
+    /// `DEC-004`.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        expect(dead_code, reason = "seccomp is consumed only by the Linux backend")
+    )]
+    pub(crate) deny_syscalls: Option<Vec<String>>,
+    /// Executables the sandboxed process (and its descendants) may run, when
+    /// `sidecar_local_exec.enforce_known_executables` is set. Empty when
+    /// execution is not restricted to a known set.
+    ///
+    /// Consumed only by `HakoniwaBackend`, which scopes Landlock's execute
+    /// right to this set so the restriction reaches descendant processes too
+    /// (FIR-366), not just the root command `mediator.allowed_executables`
+    /// already gates once at launch time.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        expect(dead_code, reason = "landlock is consumed only by the Linux backend")
+    )]
+    pub(crate) allowed_executables: Vec<PathBuf>,
     pub(crate) identity_mode: SandboxIdentityMode,
     /// Resolved `firma.toml` the agent is running under, if any.
     ///
@@ -417,5 +452,6 @@ pub(crate) fn build_backend(kind: BackendKind) -> Box<dyn SandboxBackend> {
         BackendKind::Vz => Box::new(VzBackend::new()),
         BackendKind::Wsl2 => Box::new(Wsl2Backend::new()),
         BackendKind::Firecracker => Box::new(FirecrackerBackend::new()),
+        BackendKind::Hakoniwa => Box::new(HakoniwaBackend::new()),
     }
 }

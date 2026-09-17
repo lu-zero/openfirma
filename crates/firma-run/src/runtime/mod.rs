@@ -257,6 +257,8 @@ pub fn execute_run(args: &RunInput, hooks: &LaunchHooks<'_>) -> Result<i32, RunE
                 .as_ref()
                 .ok_or_else(|| RunError::Internal("sandbox handle missing".to_string()))?;
             let effective_seccomp = resolve_effective_seccomp(&profile)?;
+            let deny_syscalls = crate::seccomp::resolve_deny_syscall_names(&profile)?
+                .map(|names| names.into_iter().map(str::to_string).collect());
             if let Some(materialized) = &effective_seccomp {
                 tracing::info!(
                     policy_id = %materialized.metadata.policy_id,
@@ -307,6 +309,13 @@ pub fn execute_run(args: &RunInput, hooks: &LaunchHooks<'_>) -> Result<i32, RunE
                 env,
                 sidecar_endpoint: effective_endpoint,
                 seccomp_filter_path: effective_seccomp.as_ref().map(|s| s.bpf_path.clone()),
+                deny_syscalls,
+                allowed_executables: profile
+                    .sidecar_local_exec
+                    .as_ref()
+                    .filter(|mediator| mediator.enforce_known_executables)
+                    .map(|mediator| mediator.allowed_executables.iter().cloned().collect())
+                    .unwrap_or_default(),
                 identity_mode: profile.identity_mode,
                 config_file: user_config_path.clone(),
                 trust_anchor,
@@ -431,7 +440,7 @@ fn resolve_launch_target(
     profile: &ResolvedProfile,
     identity: &RunIdentity,
     user_config_path: Option<&Path>,
-    env: &mut BTreeMap<String, String>,
+    env: &mut ExecutionEnv,
     command: &[String],
 ) -> Result<ResolvedLaunchTarget, RunError> {
     let mut executable = command.first().cloned().ok_or(RunError::MissingCommand)?;

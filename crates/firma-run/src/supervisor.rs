@@ -155,12 +155,16 @@ pub fn wait_with_signal_forwarding(
 /// new session (PGID = child PID) that never receives terminal signals. On
 /// Linux we read the child PID from `/proc` and send to the whole process group
 /// (`kill(-pgid)`) so every sandbox process (shell, proxy bridge, wrapped
-/// command) gets the event. Falls back to a direct send to the outer child for
-/// non-bwrap backends (vz, wsl2) where no session boundary exists.
+/// command) gets the event. Hakoniwa has no equivalent session boundary (see
+/// [`hakoniwa_sandbox_root_pid`]'s docs), so its every-descendant coverage
+/// comes from an explicit `/proc` walk instead of a single process-group send.
+/// Falls back to a direct send to the outer child for the remaining backends
+/// (vz, wsl2) where no session boundary exists either, and there is no
+/// multi-process tree to walk.
 #[cfg(unix)]
 fn forward_signal(child_pid: u32, backend: BackendKind, signal: Signal) {
-    // `backend` only selects the bwrap process-group path on Linux; elsewhere
-    // every backend uses the direct fallback below.
+    // `backend` only selects the Linux-specific paths below; elsewhere every
+    // backend uses the direct fallback at the end of this function.
     #[cfg(not(target_os = "linux"))]
     let _ = backend;
 
@@ -179,8 +183,31 @@ fn forward_signal(child_pid: u32, backend: BackendKind, signal: Signal) {
         return;
     }
 
-    // Fallback: direct send to the outer child (covers vz/wsl2/firecracker and
-    // the bwrap case where /proc children are unavailable).
+    // Hakoniwa never calls setsid() (no NewSession runctl is set), so its
+    // whole process tree shares firma-run's own process group — there is no
+    // session boundary to exploit with a single `kill(-pgid)` the way bwrap's
+    // path does. Signal every descendant of the real sandbox root
+    // individually instead, which reaches the wrapped command and any
+    // DNS-stub/proxy-bridge siblings the same way regardless.
+    #[cfg(target_os = "linux")]
+    if backend == BackendKind::Hakoniwa
+        && let Some(sandbox_root) = hakoniwa_sandbox_root_pid(child_pid)
+    {
+        for pid in hakoniwa_descendant_pids(sandbox_root) {
+            let Ok(pid) = i32::try_from(pid) else {
+                continue;
+            };
+            let target = Pid::from_raw(pid);
+            if let Err(error) = kill(target, signal) {
+                tracing::debug!("{signal} forward to hakoniwa descendant {target}: {error}");
+            }
+        }
+        return;
+    }
+
+    // Fallback: direct send to the outer child (covers vz/wsl2/firecracker,
+    // the bwrap case where /proc children are unavailable, and the hakoniwa
+    // startup window before its own descendants exist yet).
     let Ok(pid) = i32::try_from(child_pid) else {
         return;
     };
@@ -188,6 +215,79 @@ fn forward_signal(child_pid: u32, backend: BackendKind, signal: Signal) {
     if let Err(error) = kill(outer, signal) {
         tracing::debug!("{signal} forward to child {outer}: {error}");
     }
+}
+
+/// Finds the real root of a Hakoniwa sandbox's process tree, past both of
+/// Hakoniwa's own internal supervisor forks.
+///
+/// `child_pid` (`HakoniwaBackend::start_agent`'s spawned `firma-hakoniwa-runner`
+/// process) is not itself part of the sandbox: `hakoniwa::Command::spawn()`
+/// forks once to run its own setup/reap supervisor (confirmed by direct
+/// process-tree inspection — this is the pid `sandbox_child_pid` alone would
+/// return), which itself forks again to create the process that unshares the
+/// new PID namespace and ultimately `exec`s into the wrapped command. Signals
+/// must reach *that* pid and its own descendants (the wrapped command, plus
+/// any DNS-stub/proxy-bridge orchestration children — see
+/// `docs/architecture/hakoniwa-backend-plan.md`, `DEC-003`), not the two
+/// supervisor forks above it, which should be left running undisturbed to
+/// keep reaping/wait semantics correct.
+#[cfg(target_os = "linux")]
+fn hakoniwa_sandbox_root_pid(child_pid: u32) -> Option<u32> {
+    let supervisor_pid = sandbox_child_pid(child_pid)?;
+    sandbox_child_pid(supervisor_pid)
+}
+
+/// Returns every pid in `root_pid`'s process subtree (including `root_pid`
+/// itself), discovered by scanning `/proc/*/stat` for each process's parent
+/// pid.
+///
+/// A full recursive walk, unlike [`sandbox_child_pid`]'s single-child lookup:
+/// Hakoniwa's sandbox root may have multiple children (the wrapped command
+/// plus any DNS-stub/proxy-bridge orchestration processes), all of which need
+/// the signal, not just the first one discovered.
+#[cfg(target_os = "linux")]
+fn hakoniwa_descendant_pids(root_pid: u32) -> Vec<u32> {
+    let mut children_of: std::collections::HashMap<u32, Vec<u32>> =
+        std::collections::HashMap::new();
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        for entry in entries.flatten() {
+            let Some(entry_pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+                continue;
+            };
+            // Fields after the `(comm)` parenthesized group are space-separated; ppid is the
+            // second field overall, i.e. immediately after the `)`.
+            let Some((_, after_comm)) = stat.rsplit_once(')') else {
+                continue;
+            };
+            let Some(parent_pid) = after_comm
+                .split_whitespace()
+                .nth(1)
+                .and_then(|s| s.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            children_of.entry(parent_pid).or_default().push(entry_pid);
+        }
+    }
+
+    let mut result = vec![root_pid];
+    let mut frontier = vec![root_pid];
+    while let Some(pid) = frontier.pop() {
+        if let Some(children) = children_of.get(&pid) {
+            for &child in children {
+                result.push(child);
+                frontier.push(child);
+            }
+        }
+    }
+    result
 }
 
 /// Read bwrap's immediate child PID from the Linux process filesystem.
@@ -234,7 +334,10 @@ mod tests {
     use crate::supervisor::wait_with_signal_forwarding;
 
     #[cfg(target_os = "linux")]
-    use crate::supervisor::{forward_signal, parse_first_pid, sandbox_child_pid};
+    use crate::supervisor::{
+        forward_signal, hakoniwa_descendant_pids, hakoniwa_sandbox_root_pid, parse_first_pid,
+        sandbox_child_pid,
+    };
 
     /// Send `signal` to this test process after `delay`.
     ///
@@ -368,5 +471,95 @@ mod tests {
                 let _ = kill(Pid::from_raw(raw), Signal::SIGKILL);
             }
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn hakoniwa_sandbox_root_pid_skips_two_supervisor_levels() {
+        // Simulates Hakoniwa's real process tree, confirmed by direct
+        // inspection of an actual run: `child_pid` -> hakoniwa's own
+        // reap-supervisor (its first child) -> the real sandbox root (that
+        // supervisor's own first child).
+        let mut level0 = Command::new("sh")
+            .args([
+                "-c",
+                "sh -c 'sleep 5 & echo ready; wait' & echo ready; wait",
+            ])
+            .spawn()
+            .expect("spawn sh");
+        thread::sleep(Duration::from_millis(300));
+        let root = hakoniwa_sandbox_root_pid(level0.id());
+        let _ = level0.kill();
+        let _ = level0.wait();
+        // The children file requires CONFIG_PROC_CHILDREN, which is not
+        // universal, so tolerate None; any discovered PID must be valid.
+        if let Some(pid) = root {
+            assert!(pid > 0);
+            if let Ok(raw) = i32::try_from(pid) {
+                let _ = kill(Pid::from_raw(raw), Signal::SIGKILL);
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn forward_signal_hakoniwa_reaches_every_sandbox_root_descendant() {
+        // A tree shaped like a real Hakoniwa run: `level0` (this spawned
+        // process) stands in for `child_pid`, its own first child stands in
+        // for hakoniwa's internal supervisor (F1), and *that* process's own
+        // two children stand in for the sandbox root's own siblings (the
+        // wrapped command plus a DNS-stub/proxy-bridge orchestration
+        // process) — confirmed against a real process tree via direct
+        // inspection before writing this test. forward_signal must reach
+        // both of those bottom-level siblings, not just the first child the
+        // way sandbox_child_pid alone would find.
+        let mut level0 = Command::new("sh")
+            .args([
+                "-c",
+                "sh -c 'sh -c \"sleep 30 & sleep 30 & wait\" & wait' & wait",
+            ])
+            .spawn()
+            .expect("spawn sh");
+
+        // Poll rather than sleep a fixed delay: under load, both nested forks
+        // may not have completed yet by the time the first lookup succeeds.
+        let mut descendants = Vec::new();
+        let mut found_root = false;
+        for _ in 0..20 {
+            thread::sleep(Duration::from_millis(100));
+            let Some(root) = hakoniwa_sandbox_root_pid(level0.id()) else {
+                continue;
+            };
+            found_root = true;
+            descendants = hakoniwa_descendant_pids(root);
+            if descendants.len() >= 3 {
+                break;
+            }
+        }
+        if !found_root {
+            // CONFIG_PROC_CHILDREN not universal on every kernel; nothing
+            // more to verify here, but still clean up.
+            let _ = level0.kill();
+            let _ = level0.wait();
+            return;
+        }
+        assert!(
+            descendants.len() >= 3,
+            "expected the sandbox root plus both sleep siblings, got {descendants:?}"
+        );
+
+        forward_signal(level0.id(), BackendKind::Hakoniwa, Signal::SIGKILL);
+        thread::sleep(Duration::from_millis(300));
+        for pid in &descendants {
+            if let Ok(raw) = i32::try_from(*pid) {
+                // No such process confirms the forwarded signal actually killed it.
+                assert!(
+                    kill(Pid::from_raw(raw), None).is_err(),
+                    "pid {pid} should have been killed by the forwarded signal"
+                );
+            }
+        }
+        let _ = level0.kill();
+        let _ = level0.wait();
     }
 }

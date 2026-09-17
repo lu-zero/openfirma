@@ -49,6 +49,40 @@ pub(crate) fn resolve_effective_seccomp(
     Ok(Some(generated))
 }
 
+/// Resolve a profile's `deny_actions` policy to the syscall names it maps to, without compiling a
+/// BPF artifact.
+///
+/// Shared by any backend that wants the same logical policy source `resolve_effective_seccomp`
+/// compiles for the bwrap backend, but applies it through its own mechanism instead of a static
+/// BPF blob — e.g. `HakoniwaBackend`, which builds a `hakoniwa::seccomp::Filter` directly (see
+/// `docs/architecture/hakoniwa-backend-plan.md`, `DEC-004`). Returns `Ok(None)` when the profile
+/// has no seccomp policy configured, matching `resolve_effective_seccomp`'s own shape.
+///
+/// # Errors
+///
+/// Returns an error under the same conditions `resolve_effective_seccomp` does for reading and
+/// validating the policy source (missing/invalid file, unsupported actions) — but never for
+/// architecture support, since callers of this function are not restricted to
+/// `TargetArch::{X86_64, Aarch64}`.
+pub(crate) fn resolve_deny_syscall_names(
+    profile: &ResolvedProfile,
+) -> Result<Option<Vec<&'static str>>, RunError> {
+    let Some(managed) = &profile.seccomp_policy else {
+        return Ok(None);
+    };
+    let parsed_policy = parse_policy_source(&managed.source_policy_path)?;
+    validate_policy_source(&parsed_policy.parsed)?;
+    let (syscalls, unsupported_actions) =
+        map_actions_to_syscalls(&parsed_policy.parsed.deny_actions);
+    if !unsupported_actions.is_empty() {
+        return Err(RunError::ConfigValidation(format!(
+            "seccomp policy contains unsupported Cedar actions: {}; supported deny actions are: system.execute, filesystem.delete, credential.write",
+            unsupported_actions.join(", ")
+        )));
+    }
+    Ok(Some(syscalls.into_iter().map(SyscallId::name).collect()))
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CedarSubsetPolicyFile {

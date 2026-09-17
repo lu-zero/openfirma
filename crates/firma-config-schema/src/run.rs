@@ -21,6 +21,8 @@ pub enum BackendKind {
     Vz,
     Wsl2,
     Firecracker,
+    /// Experimental — see `docs/architecture/hakoniwa-backend-plan.md`.
+    Hakoniwa,
 }
 
 /// Identity mode used inside sandboxed execution.

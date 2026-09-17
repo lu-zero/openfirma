@@ -1050,6 +1050,8 @@ mod tests {
             env: env.into(),
             sidecar_endpoint: test_sidecar_endpoint(),
             seccomp_filter_path: None,
+            deny_syscalls: None,
+            allowed_executables: Vec::new(),
             identity_mode: SandboxIdentityMode::SandboxUser,
             config_file: None,
             trust_anchor: None,

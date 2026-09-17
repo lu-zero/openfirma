@@ -1,0 +1,694 @@
+//! Sibling launcher binary embedding the `hakoniwa` sandboxing library.
+//!
+//! Spawned by `HakoniwaBackend::start_agent` (in `firma-run`) via
+//! `std::process::Command`, mirroring `firma-vz-runner`'s role for the macOS
+//! VZ backend — see `docs/architecture/hakoniwa-backend-plan.md` (`DEC-001`).
+//!
+//! Slices 1 (namespace/loopback), 2 (mount translation), and 5
+//! (seccomp/Landlock) done. This file's `run_entrypoint_orchestration`
+//! reimplements `bwrap_entrypoint.sh`'s DNS-stub/proxy-bridge/watchdog/
+//! env-strip sequence natively (Slice 3, `DEC-003`).
+
+use std::collections::BTreeMap;
+use std::os::fd::AsRawFd as _;
+use std::os::unix::process::CommandExt as _;
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+use std::time::Duration;
+
+use clap::Parser;
+use hakoniwa::landlock::{CompatMode, FsAccess, Resource, Ruleset};
+use hakoniwa::seccomp::{Action, Arch, Filter};
+use hakoniwa::{Container, Namespace, Runctl};
+use serde::{Deserialize, Serialize};
+
+/// Version of the on-disk launch-contract schema this binary understands.
+const LAUNCH_CONTRACT_VERSION: u32 = 4;
+
+/// Prefix stripped from the wrapped command's environment before the final
+/// exec (mirrors `bwrap_entrypoint.sh`'s own strip loop) — see
+/// [`strip_firma_run_env`].
+const FIRMA_RUN_ENV_PREFIX: &str = "FIRMA_RUN_";
+
+/// Command/config directories granted broad *read-only* access when Landlock
+/// is active. Deliberately excludes execute: granting execute here would let
+/// every binary underneath run regardless of `LaunchContract::allowed_executables`
+/// (Landlock's `path_beneath` rules apply recursively to a directory's whole
+/// subtree). Execute on these paths is granted narrowly, per allow-listed
+/// executable, in [`build_landlock_ruleset`].
+const LANDLOCK_READ_ONLY_DIRS: &[&str] = &["/bin", "/sbin", "/etc", "/dev", "/usr"];
+
+/// Library directories granted broad *read+execute* access when Landlock is
+/// active.
+///
+/// Unlike command directories, these must get execute broadly: the kernel's
+/// ELF loader checks Landlock's execute right not only on the `execve`d
+/// binary itself but also on its ELF interpreter (`PT_INTERP`, e.g.
+/// `/lib64/ld-linux-*.so`) and, on this kernel, on every shared library the
+/// dynamic linker subsequently `mmap`s with `PROT_EXEC` — confirmed
+/// empirically (a plain read-only grant on `/usr` alone made *every* dynamic
+/// binary fail to exec with `EACCES`, including ones on the allow-list).
+/// These directories hold only libraries, not user-invocable commands, so
+/// granting execute broadly here does not undermine the allow-list — unlike
+/// doing the same for `/bin` or `/usr/bin`. On a merged-`/usr` host the
+/// classic paths below (`/lib`, `/lib64`, ...) are themselves symlinks that
+/// canonicalize to the `/usr/lib*` entries; both spellings are listed so
+/// non-merged hosts are covered too.
+const LANDLOCK_LIBRARY_DIRS: &[&str] = &[
+    "/lib",
+    "/lib64",
+    "/lib32",
+    "/usr/lib",
+    "/usr/lib64",
+    "/usr/lib32",
+];
+
+nix::ioctl_readwrite_bad!(get_iface_flags, libc::SIOCGIFFLAGS, libc::ifreq);
+nix::ioctl_readwrite_bad!(set_iface_flags, libc::SIOCSIFFLAGS, libc::ifreq);
+
+#[derive(Debug, Parser)]
+struct Cli {
+    /// Path to the serialized Hakoniwa launch contract written by
+    /// `HakoniwaBackend::start_agent`.
+    #[arg(long)]
+    launch_contract: PathBuf,
+}
+
+/// Launch payload written by `HakoniwaBackend::start_agent`.
+///
+/// Still no identity-mode support — that lands in Slice 4/2.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LaunchContract {
+    version: u32,
+    executable: String,
+    args: Vec<String>,
+    cwd: PathBuf,
+    env: BTreeMap<String, String>,
+    /// Fully resolved, validated filesystem operations computed by
+    /// `firma-run`'s `hakoniwa::mount::build_mount_ops`. This binary makes no
+    /// masking/authority decisions of its own — it replays these verbatim.
+    mounts: Vec<MountOp>,
+    deny_syscalls: Vec<String>,
+    allowed_executables: Vec<PathBuf>,
+}
+
+/// Mirrors `firma_run`'s `backend::hakoniwa::mount::HakoniwaMountOp`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum MountOp {
+    Bind {
+        source: PathBuf,
+        target: PathBuf,
+        read_only: bool,
+    },
+    Tmpfs {
+        target: PathBuf,
+    },
+}
+
+#[derive(Debug, thiserror::Error)]
+enum RunnerError {
+    #[error("failed to read launch contract: {0}")]
+    Contract(String),
+    #[error("failed to prepare sandbox: {0}")]
+    Container(String),
+    #[error("failed to bring up loopback interface: {0}")]
+    Loopback(String),
+}
+
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+    match run(&cli.launch_contract) {
+        Ok(code) => u8::try_from(code).map_or(ExitCode::FAILURE, ExitCode::from),
+        Err(error) => {
+            eprintln!("firma-hakoniwa-runner: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Reads the launch contract, builds the sandbox, and runs the wrapped
+/// command inside it, returning the wrapped command's own exit code.
+///
+/// # Errors
+///
+/// Returns an error when the contract cannot be read/parsed or the sandbox
+/// itself cannot be prepared — not when the wrapped command exits non-zero,
+/// which is reported via the returned exit code instead.
+fn run(contract_path: &Path) -> Result<i32, RunnerError> {
+    let contract = read_launch_contract(contract_path)?;
+    let needs_bridge_watchdog = contract
+        .env
+        .contains_key("FIRMA_RUN_PROXY_BRIDGE_UPSTREAM_UDS");
+
+    let mut container = Container::new();
+    container.unshare(Namespace::Network);
+    // Some bind-mount sources (e.g. `/dev/null`, used to mask config files —
+    // see `HakoniwaMountOp`) come from filesystems the host already mounted
+    // with locked flags (nosuid/noexec/nodev). Making such a bind read-only
+    // requires a second MS_REMOUNT syscall that must repeat those locked
+    // flags exactly, which hakoniwa does not query for by default;
+    // `MountFallback` retries with the source's actual flags instead of
+    // failing the whole launch with EPERM.
+    container.runctl(Runctl::MountFallback);
+    container
+        .rootfs("/")
+        .map_err(|error| RunnerError::Container(format!("failed to mount rootfs: {error}")))?;
+    container.devfsmount("/dev");
+    container.tmpfsmount("/tmp");
+    apply_mount_ops(&mut container, &contract.mounts);
+
+    if !contract.deny_syscalls.is_empty() {
+        container.seccomp_filter(build_seccomp_filter(&contract.deny_syscalls));
+    }
+    if !contract.allowed_executables.is_empty() {
+        container.landlock_ruleset(build_landlock_ruleset(&contract.allowed_executables));
+    }
+
+    // SAFETY: the closure runs inside the already-unshared, already-mounted
+    // sandboxed process (Hakoniwa's "internal process," per its own runc.rs
+    // fork sequence), before that process execs the wrapped command. It only
+    // brings up loopback (process-local ioctls on a socket it opens itself)
+    // and then replaces its own image via `exec` — it never unwinds back
+    // across the fork boundary, the same fork-then-exec contract
+    // `egress_guard.rs::install_and_exec` already relies on for the bwrap
+    // backend.
+    let mut command = unsafe {
+        container.command_from_closure(move || match bring_up_loopback() {
+            Ok(()) => run_entrypoint_orchestration(&contract),
+            Err(error) => {
+                eprintln!("firma-hakoniwa-runner: {error}");
+                125
+            }
+        })
+    };
+
+    let mut child = command.spawn().map_err(|error| {
+        RunnerError::Container(format!("failed to spawn sandboxed process: {error}"))
+    })?;
+
+    // **Discovered during implementation**: a watchdog spawned *inside* the
+    // sandbox (as a child of the process that becomes the wrapped command)
+    // cannot terminate it, no matter the signal — Hakoniwa's `Container`
+    // unshares a PID namespace, so the wrapped command is PID 1 *within it*,
+    // and the kernel protects a namespace's PID 1 from every signal sent by
+    // another process *in the same namespace*, SIGKILL included (confirmed
+    // directly: `kill -9 1` from a sibling inside a matching `unshare --pid`
+    // namespace left PID 1 running). That protection does not apply to a
+    // sender in an *ancestor* namespace, which is exactly what this process
+    // — still in the host's own PID namespace, since only the later-forked
+    // "internal process" Hakoniwa creates ends up inside the new one — is.
+    // So the watchdog lives here, as a host-side thread, discovering the
+    // bridge's host-visible pid by walking `/proc` for a descendant of the
+    // sandbox's own host-visible pid (`child.id()`), rather than as an
+    // in-sandbox process working with sandbox-relative pids.
+    if needs_bridge_watchdog {
+        let sandbox_pid = child.id();
+        std::thread::spawn(move || watch_bridge_from_host(sandbox_pid));
+    }
+
+    let status = child.wait().map_err(|error| {
+        RunnerError::Container(format!("failed to run sandboxed process: {error}"))
+    })?;
+
+    // `exit_code` is `None` exactly when the wrapped command never actually
+    // ran to completion — a genuine sandbox-setup failure (mount, unshare,
+    // seccomp/landlock load, ...) rather than the wrapped command's own exit
+    // code or signal death. `reason` is always populated (even on success),
+    // so only surface it when it describes that setup failure.
+    if status.exit_code.is_none() {
+        eprintln!(
+            "firma-hakoniwa-runner: hakoniwa sandbox setup failed: {}",
+            status.reason
+        );
+    }
+    Ok(status.code)
+}
+
+/// Builds a denylist seccomp filter: everything is allowed by default except
+/// the syscall names resolved from the profile's `deny_actions` policy, which
+/// are denied with `EPERM` — the same errno the bwrap backend's hand-rolled
+/// BPF compiler uses for the same policy (see
+/// `crates/firma-run/src/seccomp.rs`'s `EPERM_ERRNO`).
+/// Replays a fully resolved mount plan against `container`, verbatim.
+///
+/// All masking/authority decisions were already made by `firma-run`'s
+/// `HakoniwaBackend::start_agent` before this contract was serialized; this
+/// function makes none of its own. Hakoniwa applies mounts in target-path
+/// order regardless of the order they were registered in here (confirmed
+/// against `container.rs`/`runc/unshare.rs`), so this loop's order carries
+/// no security significance.
+fn apply_mount_ops(container: &mut Container, mounts: &[MountOp]) {
+    for mount in mounts {
+        match mount {
+            MountOp::Bind {
+                source,
+                target,
+                read_only,
+            } => {
+                let source = source.to_string_lossy();
+                let target = target.to_string_lossy();
+                if *read_only {
+                    container.bindmount_ro(&source, &target);
+                } else {
+                    container.bindmount_rw(&source, &target);
+                }
+            }
+            MountOp::Tmpfs { target } => {
+                container.tmpfsmount(&target.to_string_lossy());
+            }
+        }
+    }
+}
+
+fn build_seccomp_filter(deny_syscalls: &[String]) -> Filter {
+    let mut filter = Filter::new(Action::Allow);
+    filter.add_arch(Arch::Native);
+    for syscall in deny_syscalls {
+        filter.add_rule(Action::Errno(libc::EPERM), syscall);
+    }
+    filter
+}
+
+/// Builds a Landlock ruleset scoping the execute right on command/config
+/// directories to `executables`, while leaving ordinary read (and, on
+/// `/tmp`, write) access to the rootfs broadly available, and library
+/// directories broadly executable (see `LANDLOCK_LIBRARY_DIRS`).
+///
+/// Hakoniwa's `Resource::FS` restriction always handles the *full*
+/// read/write/execute access set together, not just the modes actually used
+/// in `allow_path` calls (see `runc/landlock.rs`'s `handle_access_fs`) — so
+/// restricting FS at all without granting broad read access here would brick
+/// the sandbox's ordinary library/config loading, not just narrow execute.
+/// Directories that do not exist on this host (e.g. `/lib32` without 32-bit
+/// multiarch support) are skipped — `allow_path` canonicalizes its path when
+/// the ruleset loads and hard-fails the whole sandbox launch if that fails.
+fn build_landlock_ruleset(executables: &[PathBuf]) -> Ruleset {
+    let mut ruleset = Ruleset::default();
+    ruleset.restrict(Resource::FS, CompatMode::Enforce);
+
+    for dir in LANDLOCK_READ_ONLY_DIRS {
+        if Path::new(dir).is_dir() {
+            ruleset.allow_path(dir, FsAccess::R);
+        }
+    }
+    for dir in LANDLOCK_LIBRARY_DIRS {
+        if Path::new(dir).is_dir() {
+            ruleset.allow_path(dir, FsAccess::R | FsAccess::X);
+        }
+    }
+    ruleset.allow_path("/tmp", FsAccess::R | FsAccess::W);
+
+    for executable in executables {
+        ruleset.allow_path(&executable.to_string_lossy(), FsAccess::R | FsAccess::X);
+    }
+    ruleset
+}
+
+fn read_launch_contract(path: &Path) -> Result<LaunchContract, RunnerError> {
+    let bytes = std::fs::read(path)
+        .map_err(|error| RunnerError::Contract(format!("{}: {error}", path.display())))?;
+    let contract: LaunchContract = serde_json::from_slice(&bytes)
+        .map_err(|error| RunnerError::Contract(format!("{}: {error}", path.display())))?;
+    if contract.version != LAUNCH_CONTRACT_VERSION {
+        return Err(RunnerError::Contract(format!(
+            "unsupported launch contract version {} (expected {LAUNCH_CONTRACT_VERSION})",
+            contract.version
+        )));
+    }
+    Ok(contract)
+}
+
+/// Brings up the sandbox's own loopback interface.
+///
+/// Hakoniwa does not do this itself unless a `Network` mode (`Pasta`,
+/// `RustSlirp`) is configured — omitting `Container::network(...)` entirely
+/// (as this backend does, per `DEC-002`) leaves `lo` present but down. This
+/// mirrors the handful of ioctls `hakoniwa`'s own `rustslirp` feature uses
+/// for the same purpose, without pulling in that feature's TUN-device and
+/// userspace-routing machinery, which this backend does not need.
+fn bring_up_loopback() -> Result<(), RunnerError> {
+    use nix::sys::socket::{AddressFamily, SockFlag, SockType, socket};
+
+    let fd = socket(
+        AddressFamily::Inet,
+        SockType::Datagram,
+        SockFlag::empty(),
+        None,
+    )
+    .map_err(|error| RunnerError::Loopback(format!("failed to open control socket: {error}")))?;
+
+    // SAFETY: `ifreq` is a plain C struct; zero-initializing it is valid.
+    let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
+    for (slot, byte) in ifr.ifr_name.iter_mut().zip(b"lo") {
+        *slot = libc::c_char::from(*byte);
+    }
+
+    // SAFETY: `fd` is a valid, open socket for the duration of these calls;
+    // `ifr` is fully initialized (zeroed, then its name field set) before
+    // either ioctl touches it.
+    unsafe {
+        get_iface_flags(fd.as_raw_fd(), &raw mut ifr)
+            .map_err(|error| RunnerError::Loopback(format!("SIOCGIFFLAGS: {error}")))?;
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "IFF_UP | IFF_RUNNING is a small, fixed constant that always fits in c_short"
+        )]
+        {
+            ifr.ifr_ifru.ifru_flags |= (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short;
+        }
+        set_iface_flags(fd.as_raw_fd(), &raw mut ifr)
+            .map_err(|error| RunnerError::Loopback(format!("SIOCSIFFLAGS: {error}")))?;
+    }
+    Ok(())
+}
+
+/// Replaces this process's image with the wrapped command, never returning
+/// on success. Returns a process exit code only when `exec` itself fails.
+///
+/// `Command::exec` reports one combined `io::Error` for both the `chdir`
+/// into `contract.cwd` and the `execve` of `contract.executable` — a failure
+/// here is not necessarily the executable itself. In particular, Slice 1 has
+/// no mount translation yet (Slice 2), so `contract.cwd` (always the
+/// invoking `firma run` process's real working directory) will not exist
+/// inside this bare-rootfs sandbox unless it happens to be a path the
+/// rootfs/`/tmp` mounts already provide.
+fn exec_real_command(contract: &LaunchContract, env: &BTreeMap<String, String>) -> i32 {
+    let mut command = std::process::Command::new(&contract.executable);
+    command.args(&contract.args);
+    command.current_dir(&contract.cwd);
+    command.env_clear();
+    command.envs(env);
+
+    let error = command.exec();
+    eprintln!(
+        "firma-hakoniwa-runner: failed to exec {} (cwd {}): {error}",
+        contract.executable,
+        contract.cwd.display()
+    );
+    126
+}
+
+/// Reimplements `bwrap_entrypoint.sh`'s orchestration natively (`DEC-003`),
+/// in the order the script itself uses: best-effort DNS-stub startup, a
+/// fail-closed proxy-bridge startup with a readiness handshake, an
+/// unconditional `FIRMA_RUN_*` env-strip, then either `firma
+/// __egress-guarded-run` or a direct exec of the wrapped command.
+///
+/// All three subprocess targets (`__dns-stub`, `__proxy-bridge`,
+/// `__egress-guarded-run`) are the same, already-backend-agnostic binaries
+/// `BwrapBackend` invokes — reused unchanged, not reimplemented (`DEC-003`).
+///
+/// The bridge-death watchdog bwrap's entrypoint script also runs is *not*
+/// implemented here — it runs in `run`'s own host-side thread instead. See
+/// that function's docs for why: a watchdog spawned from inside this
+/// function (i.e. inside the sandbox) cannot terminate the wrapped command,
+/// since Hakoniwa's `Container` makes it PID 1 in its own PID namespace.
+fn run_entrypoint_orchestration(contract: &LaunchContract) -> i32 {
+    let self_exe = contract.env.get("FIRMA_RUN_SELF_EXE").cloned();
+    let runtime_dir = contract.env.get("FIRMA_RUN_RUNTIME_DIR").cloned();
+
+    if let Some(self_exe) = &self_exe
+        && let Some(listen_addr) = contract.env.get("FIRMA_RUN_DNS_STUB_LISTEN_ADDR")
+    {
+        // Best-effort: DNS resolution failing is not fatal to the sandbox,
+        // matching `bwrap_entrypoint.sh`'s own non-fatal treatment. The
+        // spawned child is intentionally not retained — `Child`'s `Drop`
+        // does not kill it, so it keeps running detached in the background
+        // for the sandbox's lifetime, same as the shell script's own
+        // backgrounded `dns_pid`.
+        let _ = spawn_dns_stub(self_exe, &contract.env, listen_addr);
+    }
+
+    let bridge = match (
+        &self_exe,
+        contract.env.get("FIRMA_RUN_PROXY_BRIDGE_UPSTREAM_UDS"),
+    ) {
+        (Some(self_exe), Some(upstream_uds)) => {
+            let Some(runtime_dir) = &runtime_dir else {
+                eprintln!(
+                    "firma-hakoniwa-runner: FIRMA_RUN_PROXY_BRIDGE_UPSTREAM_UDS is set without \
+                     FIRMA_RUN_RUNTIME_DIR"
+                );
+                return 125;
+            };
+            let listen_addr = contract
+                .env
+                .get("FIRMA_RUN_PROXY_LISTEN_ADDR")
+                .map_or("127.0.0.1:18080", String::as_str);
+            match spawn_and_await_proxy_bridge(
+                self_exe,
+                &contract.env,
+                listen_addr,
+                upstream_uds,
+                runtime_dir,
+            ) {
+                Ok(child) => Some(child),
+                Err(error) => {
+                    eprintln!("firma-hakoniwa-runner: {error}");
+                    return 125;
+                }
+            }
+        }
+        _ => None,
+    };
+
+    // The bridge is deliberately not retained: `run`'s own host-side thread
+    // (see its docs) monitors it independently by walking `/proc` for its
+    // host-visible pid, since a watchdog running inside the sandbox cannot
+    // terminate the sandbox's own PID 1 by any signal. Dropping this handle
+    // does not kill the bridge (`Child`'s `Drop` never does), so it keeps
+    // running detached for the rest of this run.
+    drop(bridge);
+
+    let egress_guard_sock = contract.env.get("FIRMA_RUN_EGRESS_GUARD_SOCK").cloned();
+    let stripped_env = strip_firma_run_env(&contract.env);
+
+    if let (Some(self_exe), Some(sock)) = (&self_exe, &egress_guard_sock) {
+        let mut command = std::process::Command::new(self_exe);
+        command
+            .arg("__egress-guarded-run")
+            .arg("--supervisor-socket")
+            .arg(sock)
+            .arg("--")
+            .arg(&contract.executable)
+            .args(&contract.args)
+            .current_dir(&contract.cwd)
+            .env_clear()
+            .envs(&stripped_env);
+        let error = command.exec();
+        eprintln!("firma-hakoniwa-runner: failed to exec {self_exe} __egress-guarded-run: {error}");
+        return 126;
+    }
+
+    exec_real_command(contract, &stripped_env)
+}
+
+/// Starts `firma __dns-stub --listen <listen_addr>`.
+///
+/// Best-effort, mirroring `bwrap_entrypoint.sh`: a failed or crashed stub
+/// does not fail the sandbox launch, since the sandboxed process still has a
+/// fail-closed path (no other route out once the network namespace is
+/// unshared) — it only loses DNS resolution through the stub. Returns the
+/// spawned child on success so the caller can deliberately leak it (see
+/// [`run_entrypoint_orchestration`]); returns `None` and logs otherwise.
+fn spawn_dns_stub(
+    self_exe: &str,
+    env: &BTreeMap<String, String>,
+    listen_addr: &str,
+) -> Option<std::process::Child> {
+    let mut child = std::process::Command::new(self_exe)
+        .arg("__dns-stub")
+        .arg("--listen")
+        .arg(listen_addr)
+        .env_clear()
+        .envs(env)
+        .spawn()
+        .inspect_err(|error| {
+            eprintln!("firma-hakoniwa-runner: failed to spawn dns stub: {error}");
+        })
+        .ok()?;
+
+    // Give the stub a brief window to bind before the wrapped command
+    // starts, matching `bwrap_entrypoint.sh`'s own fixed 0.2s wait.
+    std::thread::sleep(Duration::from_millis(200));
+    match child.try_wait() {
+        Ok(None) => Some(child),
+        Ok(Some(status)) => {
+            eprintln!("firma-hakoniwa-runner: dns stub exited during startup: {status}");
+            None
+        }
+        Err(error) => {
+            eprintln!("firma-hakoniwa-runner: failed to poll dns stub: {error}");
+            None
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+enum ProxyBridgeError {
+    #[error("failed to spawn proxy bridge: {0}")]
+    Spawn(std::io::Error),
+    #[error("proxy bridge exited during startup")]
+    ExitedDuringStartup,
+    #[error("proxy bridge did not signal readiness within 5 seconds")]
+    ReadinessTimeout,
+    #[error("failed to poll proxy bridge: {0}")]
+    Poll(std::io::Error),
+}
+
+/// Starts `firma __proxy-bridge` and waits for its readiness marker file,
+/// mirroring `bwrap_entrypoint.sh`'s handshake exactly (50 polls of 100ms —
+/// 5s total). Unlike the DNS stub, a failure here is fatal: the agent has no
+/// other route to the Sidecar once the network namespace is unshared.
+fn spawn_and_await_proxy_bridge(
+    self_exe: &str,
+    env: &BTreeMap<String, String>,
+    listen_addr: &str,
+    upstream_uds: &str,
+    runtime_dir: &str,
+) -> Result<std::process::Child, ProxyBridgeError> {
+    let mut child = std::process::Command::new(self_exe)
+        .arg("__proxy-bridge")
+        .arg("--listen")
+        .arg(listen_addr)
+        .arg("--upstream-uds")
+        .arg(upstream_uds)
+        .env_clear()
+        .envs(env)
+        .spawn()
+        .map_err(ProxyBridgeError::Spawn)?;
+
+    let ready_file = Path::new(runtime_dir).join("proxy-bridge-ready");
+    for _ in 0..50 {
+        if ready_file.is_file() {
+            return Ok(child);
+        }
+        if child.try_wait().map_err(ProxyBridgeError::Poll)?.is_some() {
+            return Err(ProxyBridgeError::ExitedDuringStartup);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let _ = child.kill();
+    Err(ProxyBridgeError::ReadinessTimeout)
+}
+
+/// Host-side watchdog thread body: finds the proxy bridge among `sandbox_pid`'s descendants (as
+/// seen from *this* process's own, host, PID namespace — see `run`'s docs), then polls its
+/// liveness and `SIGKILL`s the whole sandbox the moment it is gone.
+///
+/// `SIGKILL` from here works precisely because this process is in an ancestor namespace relative
+/// to the sandbox: a namespace's PID 1 is immune to every signal — `SIGKILL` included — sent by
+/// another process *inside the same namespace*, but not to one sent from outside it.
+fn watch_bridge_from_host(sandbox_pid: u32) {
+    use nix::sys::signal::{self, Signal};
+    use nix::unistd::Pid;
+
+    let Some(bridge_pid) =
+        find_descendant_pid_by_cmdline(sandbox_pid, "__proxy-bridge", Duration::from_secs(10))
+    else {
+        eprintln!(
+            "firma-hakoniwa-runner: proxy bridge did not appear among the sandbox's descendants \
+             within 10s; its watchdog is not armed"
+        );
+        return;
+    };
+
+    loop {
+        if signal::kill(Pid::from_raw(bridge_pid), None).is_err() {
+            eprintln!(
+                "firma-hakoniwa-runner: proxy bridge (host pid {bridge_pid}) exited \
+                 unexpectedly; terminating the sandbox fail-closed"
+            );
+            let Ok(sandbox_pid) = i32::try_from(sandbox_pid) else {
+                return;
+            };
+            let _ = signal::kill(Pid::from_raw(sandbox_pid), Signal::SIGKILL);
+            return;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+/// Polls `/proc` for a descendant of `root_pid` whose `cmdline` contains `substr`, up to
+/// `timeout`. Returns its pid (in the caller's own PID namespace) on the first match.
+fn find_descendant_pid_by_cmdline(root_pid: u32, substr: &str, timeout: Duration) -> Option<i32> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        for pid in descendant_pids(root_pid) {
+            let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+            if cmdline
+                .split(|byte| *byte == 0)
+                .any(|arg| String::from_utf8_lossy(arg).contains(substr))
+            {
+                return Some(pid);
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Returns every pid in `root_pid`'s process subtree (including `root_pid` itself), discovered by
+/// scanning `/proc/*/stat` for each process's parent pid, as seen from the caller's own PID
+/// namespace.
+fn descendant_pids(root_pid: u32) -> Vec<i32> {
+    let mut children_of: std::collections::HashMap<i32, Vec<i32>> =
+        std::collections::HashMap::new();
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        for entry in entries.flatten() {
+            let Some(entry_pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<i32>().ok())
+            else {
+                continue;
+            };
+            let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+                continue;
+            };
+            // Fields after the `(comm)` parenthesized group are space-separated; ppid is the
+            // second field overall, i.e. immediately after the `)`.
+            let Some((_, after_comm)) = stat.rsplit_once(')') else {
+                continue;
+            };
+            let Some(parent_pid) = after_comm
+                .split_whitespace()
+                .nth(1)
+                .and_then(|s| s.parse::<i32>().ok())
+            else {
+                continue;
+            };
+            children_of.entry(parent_pid).or_default().push(entry_pid);
+        }
+    }
+
+    let Ok(root_pid) = i32::try_from(root_pid) else {
+        return Vec::new();
+    };
+    let mut result = vec![root_pid];
+    let mut frontier = vec![root_pid];
+    while let Some(pid) = frontier.pop() {
+        if let Some(children) = children_of.get(&pid) {
+            for &child in children {
+                result.push(child);
+                frontier.push(child);
+            }
+        }
+    }
+    result
+}
+
+/// Strips every `FIRMA_RUN_*` control variable before the final exec,
+/// mirroring `bwrap_entrypoint.sh`'s own strip loop: the wrapped command and
+/// anything it spawns must not inherit this sandbox's identity or runtime
+/// paths — a nested `firma run` that inherited `FIRMA_RUN_SANDBOX_ID` would
+/// derive this live session's runtime dir and could get it bind-mounted
+/// read-write into the inner sandbox.
+fn strip_firma_run_env(env: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    env.iter()
+        .filter(|(key, _)| !key.starts_with(FIRMA_RUN_ENV_PREFIX))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}

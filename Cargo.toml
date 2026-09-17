@@ -10,6 +10,7 @@ members = [
   "crates/firma-demo-tui",
   "crates/firma-fs",
   "crates/firma-grpc-interceptor-proto",
+  "crates/firma-hakoniwa-runner",
   "crates/firma-http",
   "crates/firma-identifiers",
   "crates/firma-process-orchestrator",
@@ -105,6 +106,7 @@ form_urlencoded = "1"
 fs-err = "3.3"
 fs2 = "0.4.3"
 governor = "0.10"
+hakoniwa = "=1.7.2"
 headers = "0.4"
 hex = "0.4"
 http = "1"

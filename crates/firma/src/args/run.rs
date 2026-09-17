@@ -143,6 +143,7 @@ pub enum BackendOverride {
     Vz,
     Wsl2,
     Firecracker,
+    Hakoniwa,
 }
 
 /// User-facing identity mode override values.
@@ -159,6 +160,7 @@ impl From<BackendOverride> for BackendKind {
             BackendOverride::Vz => Self::Vz,
             BackendOverride::Wsl2 => Self::Wsl2,
             BackendOverride::Firecracker => Self::Firecracker,
+            BackendOverride::Hakoniwa => Self::Hakoniwa,
         }
     }
 }

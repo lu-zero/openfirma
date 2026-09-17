@@ -1,0 +1,33 @@
+[package]
+name = "firma-hakoniwa-runner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Hakoniwa-embedding runner for OpenFirma Linux sandbox launch contracts"
+
+[[bin]]
+name = "firma-hakoniwa-runner"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true, features = ["derive", "error-context", "help", "std", "usage"] }
+hakoniwa = { workspace = true, features = ["landlock", "seccomp"] }
+libc = { workspace = true }
+nix = { workspace = true, features = ["ioctl"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[lints.clippy]
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+missing_const_for_fn = "allow"
+
+[lints.rust]
+unsafe_code = "allow"

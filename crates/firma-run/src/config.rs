@@ -28,7 +28,7 @@ use crate::profile::built_in_profile;
 use crate::runtime::RunInput;
 
 fn backend_supports_structural_network(backend: BackendKind) -> bool {
-    matches!(backend, BackendKind::Bwrap)
+    matches!(backend, BackendKind::Bwrap | BackendKind::Hakoniwa)
 }
 
 impl From<SchemaBackendKind> for BackendKind {
@@ -38,6 +38,7 @@ impl From<SchemaBackendKind> for BackendKind {
             SchemaBackendKind::Vz => Self::Vz,
             SchemaBackendKind::Wsl2 => Self::Wsl2,
             SchemaBackendKind::Firecracker => Self::Firecracker,
+            SchemaBackendKind::Hakoniwa => Self::Hakoniwa,
         }
     }
 }
@@ -49,6 +50,7 @@ impl From<BackendKind> for SchemaBackendKind {
             BackendKind::Vz => Self::Vz,
             BackendKind::Wsl2 => Self::Wsl2,
             BackendKind::Firecracker => Self::Firecracker,
+            BackendKind::Hakoniwa => Self::Hakoniwa,
         }
     }
 }
@@ -164,9 +166,9 @@ impl ResolvedProfile {
                     managed.artifact_dir.display()
                 )));
             }
-            if self.backend != BackendKind::Bwrap {
+            if !matches!(self.backend, BackendKind::Bwrap | BackendKind::Hakoniwa) {
                 return Err(RunError::ConfigValidation(format!(
-                    "seccomp_policy is only supported with backend 'bwrap', got '{backend}'",
+                    "seccomp_policy is only supported with backends 'bwrap' and 'hakoniwa', got '{backend}'",
                     backend = self.backend
                 )));
             }
@@ -724,7 +726,9 @@ fn default_backend_for_host() -> BackendKind {
 
 fn backend_supported_on_host(kind: BackendKind) -> bool {
     match kind {
-        BackendKind::Bwrap | BackendKind::Firecracker => cfg!(target_os = "linux"),
+        BackendKind::Bwrap | BackendKind::Firecracker | BackendKind::Hakoniwa => {
+            cfg!(target_os = "linux")
+        }
         BackendKind::Vz => cfg!(target_os = "macos"),
         BackendKind::Wsl2 => {
             cfg!(target_os = "windows") || (cfg!(target_os = "linux") && detect_wsl().is_wsl())
@@ -2937,9 +2941,48 @@ artifact_dir = '{}'
         let err = resolve_profile(&run_args).expect_err("expected backend validation error");
         assert!(
             err.to_string()
-                .contains("seccomp_policy is only supported with backend 'bwrap'"),
+                .contains("seccomp_policy is only supported with backends 'bwrap' and 'hakoniwa'"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    #[cfg_attr(not(target_os = "linux"), ignore = "hakoniwa is Linux-only")]
+    fn seccomp_policy_resolves_when_configured_for_hakoniwa() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let policy_path = tmpdir.path().join("policy.toml");
+        fs::write(
+            &policy_path,
+            r#"
+policy_id = "generic-local-command"
+policy_version = "v1"
+default_action = "allow"
+deny_actions = ["filesystem.delete"]
+"#,
+        )
+        .unwrap();
+        let artifact_dir = tmpdir.path().join("artifacts");
+
+        let config_path = tmpdir.path().join(CONFIG_FILE_NAME);
+        let toml = format!(
+            r#"
+[run.profiles.generic]
+backend = "hakoniwa"
+sidecar_endpoint = "unix:///tmp/sidecar.sock"
+
+[run.profiles.generic.seccomp_policy]
+source_policy_path = '{}'
+artifact_dir = '{}'
+"#,
+            policy_path.display(),
+            artifact_dir.display()
+        );
+        fs::write(&config_path, toml).unwrap();
+
+        let mut run_args = args("generic");
+        run_args.config = Some(config_path);
+        let resolved = resolve_profile(&run_args).unwrap();
+        assert!(resolved.seccomp_policy.is_some());
     }
 
     #[test]
