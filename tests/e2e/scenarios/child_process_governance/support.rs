@@ -98,3 +98,20 @@ pub(super) fn first_existing(candidates: &[&str]) -> Option<PathBuf> {
         .map(PathBuf::from)
         .find(|path| path.exists())
 }
+
+/// Marker text a forbidden-tool script prints to stdout if it ever runs, so
+/// a scenario can detect an ungoverned execution even when its own marker
+/// file check is inconclusive (e.g. output captured before a kill).
+pub(super) const FORBIDDEN_MARKER: &str = "FORBIDDEN-TOOL EXECUTED";
+
+/// Writes an executable script to `path` that prints [`FORBIDDEN_MARKER`]
+/// and touches `marker` if it ever runs — the shared "should never execute"
+/// probe used by every ungoverned-child scenario in this module.
+pub(super) fn write_forbidden_tool(path: &Path, marker: &Path) {
+    let script = format!(
+        "#!/bin/sh\necho \"{FORBIDDEN_MARKER} pid=$$ argv=$*\"\n: > {marker}\n",
+        marker = shell_quote(marker),
+    );
+    std::fs::write(path, script).expect("write forbidden-tool");
+    set_executable(path);
+}

@@ -1,14 +1,11 @@
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use crate::harness::{ProcessOutput, TestWorld};
 
 use super::support::{
-    assert_only_root_governed, first_existing, patch_local_exec_allowlist, set_executable,
-    shell_quote, spawn_allow_all_endpoint,
+    FORBIDDEN_MARKER, assert_only_root_governed, first_existing, patch_local_exec_allowlist,
+    shell_quote, spawn_allow_all_endpoint, write_forbidden_tool,
 };
-
-const FORBIDDEN_MARKER: &str = "FORBIDDEN-TOOL EXECUTED";
 
 #[test]
 #[ignore = "integration test — run with --include-ignored (regression target for FIR-366; fails until child-process governance lands)"]
@@ -97,13 +94,4 @@ fn child_process_escapes_run_governance() {
 
 fn output_contains(output: &ProcessOutput, needle: &str) -> bool {
     output.stdout.contains(needle) || output.stderr.contains(needle)
-}
-
-fn write_forbidden_tool(path: &Path, marker: &Path) {
-    let script = format!(
-        "#!/bin/sh\necho \"{FORBIDDEN_MARKER} pid=$$ argv=$*\"\n: > {marker}\n",
-        marker = shell_quote(marker),
-    );
-    std::fs::write(path, script).expect("write forbidden-tool");
-    set_executable(path);
 }

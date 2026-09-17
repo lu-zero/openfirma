@@ -18,7 +18,8 @@ use firma_config_schema::run::{
 };
 pub(crate) use firma_config_schema::run::{
     CaTrustMode, CapabilityLeasePatch, CapabilitySourcePatch, CommandMediatorHitlMode,
-    ExecutableLaunchPolicyPatch, MountPatch, NetworkPolicyPatch, ProfilePatch, SeccompRuntimeMode,
+    ExecutableLaunchPolicyPatch, ExecutionGovernanceStrategy, MountPatch, NetworkPolicyPatch,
+    ProfilePatch, SeccompRuntimeMode,
 };
 
 use crate::backend::BackendKind;
@@ -69,6 +70,7 @@ pub struct ResolvedProfile {
     pub(crate) seccomp_policy: Option<SeccompPolicyConfig>,
     pub(crate) network: NetworkPolicy,
     pub(crate) identity_mode: SandboxIdentityMode,
+    pub(crate) execution_governance: ExecutionGovernanceStrategy,
     pub capability: CapabilityLeaseConfig,
     pub(crate) sidecar_local_exec: Option<CommandMediatorConfig>,
     pub(crate) executable_policies: BTreeMap<String, ExecutableLaunchPolicy>,
@@ -487,6 +489,7 @@ impl Merge for ProfilePatch {
                 (lower, higher) => higher.or(lower),
             },
             identity_mode: higher.identity_mode.or(self.identity_mode),
+            execution_governance: higher.execution_governance.or(self.execution_governance),
             capability: match (self.capability, higher.capability) {
                 (Some(lower), Some(higher)) => Some(lower.merge(higher)),
                 (lower, higher) => higher.or(lower),
@@ -638,6 +641,15 @@ pub(crate) fn resolve_profile_with_layout(
         .identity_mode
         .unwrap_or(SandboxIdentityMode::SandboxUser);
 
+    let execution_governance = patch.execution_governance.unwrap_or_default();
+    if execution_governance != ExecutionGovernanceStrategy::Inherited {
+        validate_execution_governance_preconditions(
+            execution_governance,
+            backend,
+            sidecar_local_exec.as_ref(),
+        )?;
+    }
+
     let executable_policies = patch
         .executable_policies
         .unwrap_or_default()
@@ -671,6 +683,7 @@ pub(crate) fn resolve_profile_with_layout(
         seccomp_policy,
         network,
         identity_mode,
+        execution_governance,
         capability,
         sidecar_local_exec,
         executable_policies,
@@ -724,6 +737,45 @@ fn default_backend_for_host() -> BackendKind {
     }
 }
 
+/// Rejects an `execution_governance` selection at config-resolution time
+/// rather than silently downgrading to `Inherited` — a caller who asked for
+/// descendant-process governance and got a lower-severity guarantee than
+/// they configured is a silent security regression, unlike `backend`'s own
+/// "fall back to the platform default" resolution (`resolve_backend`), where
+/// every fallback still provides some real backend.
+///
+/// `PtraceSeccompExec` currently assumes the sandboxed process tree runs
+/// under `bwrap`'s own PID namespace (`sandbox_child_pid`'s attach target)
+/// — see `docs/architecture/ptrace-seccomp-exec-gate-plan.md`'s own
+/// Assumptions — so it is scoped to `BackendKind::Bwrap` only, not every
+/// Linux-capable backend. It also assumes `sidecar_local_exec` is
+/// configured with a non-empty, enforced `allowed_executables` set to
+/// actually check descendant execs against; without that there is nothing
+/// for this strategy to enforce.
+fn validate_execution_governance_preconditions(
+    strategy: ExecutionGovernanceStrategy,
+    backend: BackendKind,
+    sidecar_local_exec: Option<&CommandMediatorConfig>,
+) -> Result<(), RunError> {
+    if backend != BackendKind::Bwrap {
+        return Err(RunError::ConfigValidation(format!(
+            "execution_governance = '{strategy:?}' is unsupported for backend '{backend}'; only \
+             'bwrap' is supported"
+        )));
+    }
+    let enforced = sidecar_local_exec.is_some_and(|mediator| {
+        mediator.enforce_known_executables && !mediator.allowed_executables.is_empty()
+    });
+    if !enforced {
+        return Err(RunError::ConfigValidation(format!(
+            "execution_governance = '{strategy:?}' requires sidecar_local_exec with \
+             enforce_known_executables = true and a non-empty allowed_executables set — there is \
+             nothing to check descendant execs against otherwise"
+        )));
+    }
+    Ok(())
+}
+
 fn backend_supported_on_host(kind: BackendKind) -> bool {
     match kind {
         BackendKind::Bwrap | BackendKind::Firecracker | BackendKind::Hakoniwa => {
@@ -764,6 +816,7 @@ fn cli_profile_patch(args: &RunInput) -> ProfilePatch {
         } else {
             args.identity_mode
         },
+        execution_governance: None,
         capability: args
             .capability_file
             .as_ref()
@@ -1719,6 +1772,103 @@ secret_providers = ["op"]
     }
 
     #[test]
+    fn execution_governance_ptrace_seccomp_exec_requires_bwrap_backend() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let config_path = tmpdir.path().join(CONFIG_FILE_NAME);
+        let toml = format!(
+            r#"
+[run.profiles.codex]
+backend = "{backend}"
+execution_governance = "ptrace_seccomp_exec"
+
+[run.profiles.codex.sidecar_local_exec]
+endpoint = "unix:///tmp/execution-governance-test.sock"
+timeout = "2s"
+enforce_known_executables = true
+allowed_executables = ["/bin/bash"]
+"#,
+            backend = non_bwrap_backend_for_current_host()
+        );
+        fs::write(&config_path, toml).unwrap();
+
+        let mut run_args = args("codex");
+        run_args.config = Some(config_path);
+
+        let err = resolve_profile(&run_args).unwrap_err();
+        let RunError::ConfigValidation(message) = err else {
+            panic!("expected ConfigValidation, got {err:?}");
+        };
+        assert!(
+            message.contains("is unsupported for backend"),
+            "expected the backend-mismatch gate's own message, got: {message}"
+        );
+    }
+
+    #[test]
+    fn execution_governance_ptrace_seccomp_exec_requires_enforced_allowed_executables() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let config_path = tmpdir.path().join(CONFIG_FILE_NAME);
+        let toml = r#"
+[run.profiles.codex]
+backend = "bwrap"
+execution_governance = "ptrace_seccomp_exec"
+"#;
+        fs::write(&config_path, toml).unwrap();
+
+        let mut run_args = args("codex");
+        run_args.config = Some(config_path);
+
+        let err = resolve_profile(&run_args).unwrap_err();
+        let RunError::ConfigValidation(message) = err else {
+            panic!("expected ConfigValidation, got {err:?}");
+        };
+        assert!(
+            message.contains("requires sidecar_local_exec"),
+            "expected the missing-allowlist gate's own message, got: {message}"
+        );
+    }
+
+    #[test]
+    fn execution_governance_ptrace_seccomp_exec_resolves_with_bwrap_and_enforced_allowlist() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let config_path = tmpdir.path().join(CONFIG_FILE_NAME);
+        let toml = r#"
+[run.profiles.codex]
+backend = "bwrap"
+sidecar_endpoint = "unix:///tmp/execution-governance-test-sidecar.sock"
+execution_governance = "ptrace_seccomp_exec"
+
+[run.profiles.codex.sidecar_local_exec]
+endpoint = "unix:///tmp/execution-governance-test.sock"
+timeout = "2s"
+enforce_known_executables = true
+allowed_executables = ["/bin/bash"]
+"#;
+        fs::write(&config_path, toml).unwrap();
+
+        let mut run_args = args("codex");
+        run_args.config = Some(config_path);
+
+        let resolved = resolve_profile(&run_args).unwrap();
+        assert_eq!(
+            resolved.execution_governance,
+            super::ExecutionGovernanceStrategy::PtraceSeccompExec
+        );
+    }
+
+    #[test]
+    fn execution_governance_defaults_to_inherited_and_is_unchecked() {
+        // No sidecar_local_exec, no execution_governance set at all — must
+        // resolve cleanly, proving the new gate only activates for a
+        // non-default strategy (existing profiles must be unaffected).
+        let resolved = resolve_profile(&args("codex")).unwrap();
+        assert_eq!(
+            resolved.execution_governance,
+            super::ExecutionGovernanceStrategy::Inherited
+        );
+    }
+
+    #[test]
     fn secret_providers_named_entry_unknown_builtin_errors() {
         let tmpdir = tempfile::tempdir().unwrap();
         let config_path = tmpdir.path().join(CONFIG_FILE_NAME);
@@ -2188,6 +2338,7 @@ approval_policy = "never"
             mounts,
             network,
             identity_mode: _,
+            execution_governance: _,
             capability,
             sidecar_local_exec,
             executable_policies,

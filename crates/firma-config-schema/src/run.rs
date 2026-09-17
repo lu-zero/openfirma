@@ -55,6 +55,30 @@ pub enum CaTrustMode {
     AppendSystemRoots,
 }
 
+/// How the wrapped agent's *descendant* processes are governed for the
+/// `sidecar_local_exec.allowed_executables` restriction.
+///
+/// `sidecar_local_exec`'s own root-level check (`enforce_local_command_governance`
+/// in `firma-run`) always covers the launched root command regardless of this
+/// setting; this axis only controls whether that same restriction extends to
+/// processes the root command itself spawns (closing FIR-366's gap). See
+/// `docs/architecture/selectable-execution-governance-plan.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionGovernanceStrategy {
+    /// Today's behavior: only the root command is checked against
+    /// `allowed_executables`. A descendant process the root spawns is not
+    /// independently governed.
+    #[default]
+    Inherited,
+    /// A host-side `ptrace(2)` attach plus a `SECCOMP_RET_TRACE` filter
+    /// scoped to `execve`/`execveat` traps every exec in the sandboxed
+    /// process's whole subtree (not just the root), checking each one
+    /// against `allowed_executables` before allowing it to proceed. See
+    /// `docs/architecture/ptrace-seccomp-exec-gate-plan.md`.
+    PtraceSeccompExec,
+}
+
 /// Runtime behavior for managed seccomp artifact selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -96,6 +120,9 @@ pub struct ProfilePatch {
     pub mounts: Option<Vec<MountPatch>>,
     pub network: Option<NetworkPolicyPatch>,
     pub identity_mode: Option<SandboxIdentityMode>,
+    /// How descendant processes are governed for `allowed_executables`.
+    /// `None` resolves to `ExecutionGovernanceStrategy::Inherited`.
+    pub execution_governance: Option<ExecutionGovernanceStrategy>,
     pub capability: Option<CapabilityLeasePatch>,
     /// Preferred governance config path. This routes local tool execution
     /// decisions through a Sidecar-owned endpoint.

@@ -12,6 +12,14 @@ pub mod dns_stub;
 pub mod egress_guard;
 pub mod env;
 pub mod error;
+/// Pluggable descendant-process exec governance.
+///
+/// The `PtraceSeccompExec` strategy's shim-facing pieces
+/// ([`execution_governance::ptrace_seccomp`]) are called from the
+/// `crates/firma` `__exec-guarded-run` binary, so this module is `pub`
+/// (like [`egress_guard`], for the same reason), even though `firma-run`
+/// itself is an internal, `publish = false` crate not subject to semver.
+pub mod execution_governance;
 pub mod identity;
 pub mod log;
 pub(crate) mod mediator;

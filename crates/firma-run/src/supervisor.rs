@@ -83,7 +83,7 @@ pub fn wait_with_signal_forwarding(
 /// caller (which reports the same two facts through `nix::sys::wait::WaitStatus`,
 /// not `ExitStatus`) can share this mapping instead of duplicating it.
 #[cfg(unix)]
-fn exit_code_from_outcome(exit_code: Option<i32>, term_signal: Option<i32>) -> i32 {
+pub fn exit_code_from_outcome(exit_code: Option<i32>, term_signal: Option<i32>) -> i32 {
     exit_code.unwrap_or_else(|| term_signal.map_or(1, |signal| 128 + signal))
 }
 
@@ -162,7 +162,7 @@ pub fn wait_with_signal_forwarding(
 /// (vz, wsl2) where no session boundary exists either, and there is no
 /// multi-process tree to walk.
 #[cfg(unix)]
-fn forward_signal(child_pid: u32, backend: BackendKind, signal: Signal) {
+pub fn forward_signal(child_pid: u32, backend: BackendKind, signal: Signal) {
     // `backend` only selects the Linux-specific paths below; elsewhere every
     // backend uses the direct fallback at the end of this function.
     #[cfg(not(target_os = "linux"))]

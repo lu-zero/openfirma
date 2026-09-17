@@ -128,6 +128,26 @@ pub struct EgressGuardedRunArgs {
     pub command: Vec<String>,
 }
 
+/// Internal helper args for the `PtraceSeccompExec` execution-governance
+/// strategy's exec-gate runner process.
+///
+/// Runs inside the sandbox: installs the `execve`/`execveat`-only
+/// `SECCOMP_RET_TRACE` filter, hands a readiness signal to the host
+/// supervisor at `--handshake-socket` (which seizes this process via
+/// `ptrace(2)` before releasing it), then execs the wrapped command. See
+/// `docs/architecture/ptrace-seccomp-exec-gate-plan.md`.
+#[derive(Debug, Args)]
+pub struct ExecGuardedRunArgs {
+    /// Host supervisor handshake socket: this process sends one readiness
+    /// byte and blocks reading one byte back before proceeding to exec.
+    #[arg(long)]
+    pub handshake_socket: PathBuf,
+
+    /// Wrapped command and args (pass after `--`).
+    #[arg(last = true, required = true, num_args = 1.., allow_hyphen_values = true)]
+    pub command: Vec<String>,
+}
+
 /// Internal helper args for DNS stub process.
 #[derive(Debug, Clone, Copy, Args)]
 pub struct DnsStubArgs {

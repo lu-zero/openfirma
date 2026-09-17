@@ -42,7 +42,7 @@ tracing-subscriber.workspace = true
 uuid.workspace = true
 
 [target.'cfg(unix)'.dependencies]
-nix = { workspace = true, features = ["process", "signal", "socket", "uio"] }
+nix = { workspace = true, features = ["process", "ptrace", "signal", "socket", "uio"] }
 signal-hook.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]

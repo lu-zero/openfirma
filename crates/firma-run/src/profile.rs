@@ -74,6 +74,7 @@ fn generic_profile() -> ProfilePatch {
             fail_closed: Some(true),
         }),
         identity_mode: None,
+        execution_governance: None,
         capability: Some(CapabilityLeasePatch {
             source: Some(CapabilitySourcePatch::Disabled),
             public_key_path: None,

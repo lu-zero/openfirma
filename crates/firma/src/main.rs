@@ -30,6 +30,8 @@ fn main() -> ExitCode {
         Command::DnsStub(a) => services::dns_stub::run(a),
         #[cfg(target_os = "linux")]
         Command::EgressGuardedRun(a) => services::egress_guarded_run::run(a),
+        #[cfg(target_os = "linux")]
+        Command::ExecGuardedRun(a) => services::exec_guarded_run::run(a),
         Command::Doctor(a) => Ok(services::doctor::run(a, config.as_deref())),
         Command::Config(a) => services::config::run(&a),
         Command::Control(a) => services::control::run(&a, config.as_deref()),

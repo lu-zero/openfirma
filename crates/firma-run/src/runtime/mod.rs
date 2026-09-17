@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -11,11 +12,11 @@ use crate::capability::read_capability_token;
 use crate::config::{CapabilitySource, ResolvedProfile, resolve_profile_with_layout};
 use crate::env::ExecutionEnv;
 use crate::error::RunError;
+use crate::execution_governance;
 use crate::identity::RunIdentity;
 use crate::mediator::enforce_local_command_governance;
 use crate::routing::{AutostartFlags, ResolveAuthorityRequest, prepare_network_runtime};
 use crate::seccomp::resolve_effective_seccomp;
-use crate::supervisor::wait_with_signal_forwarding;
 use crate::trust::SidecarTrustAnchor;
 
 const DEFAULT_SIDECAR_STARTUP_TIMEOUT_SECS: u64 = 10;
@@ -288,7 +289,8 @@ pub fn execute_run(args: &RunInput, hooks: &LaunchHooks<'_>) -> Result<i32, RunE
                 .with_capability_token(capability_token.as_deref())
                 .with_capability_source(&profile.capability.source);
 
-            let target = resolve_launch_target(
+            let sandbox_runtime_dir = handle_ref.runtime_dir.clone();
+            let mut target = resolve_launch_target(
                 handle_ref,
                 &profile,
                 &identity,
@@ -302,6 +304,19 @@ pub fn execute_run(args: &RunInput, hooks: &LaunchHooks<'_>) -> Result<i32, RunE
                     .ok_or_else(|| RunError::Internal("sandbox handle missing".to_string()))?;
                 vscode::ensure_vscode_state_mount(handle_mut, state_dir);
             }
+            let allowed_executables: BTreeSet<PathBuf> = profile
+                .sidecar_local_exec
+                .as_ref()
+                .filter(|mediator| mediator.enforce_known_executables)
+                .map(|mediator| mediator.allowed_executables.iter().cloned().collect())
+                .unwrap_or_default();
+            let governor = execution_governance::build_governor(profile.execution_governance);
+            let governance_handle = governor.rewrite_launch(
+                &execution_governance::AllowedExecutables::new(allowed_executables.clone()),
+                &sandbox_runtime_dir,
+                &mut target.executable,
+                &mut target.args,
+            )?;
             let launch = LaunchSpec {
                 executable: target.executable,
                 args: target.args,
@@ -310,12 +325,7 @@ pub fn execute_run(args: &RunInput, hooks: &LaunchHooks<'_>) -> Result<i32, RunE
                 sidecar_endpoint: effective_endpoint,
                 seccomp_filter_path: effective_seccomp.as_ref().map(|s| s.bpf_path.clone()),
                 deny_syscalls,
-                allowed_executables: profile
-                    .sidecar_local_exec
-                    .as_ref()
-                    .filter(|mediator| mediator.enforce_known_executables)
-                    .map(|mediator| mediator.allowed_executables.iter().cloned().collect())
-                    .unwrap_or_default(),
+                allowed_executables: allowed_executables.into_iter().collect(),
                 identity_mode: profile.identity_mode,
                 config_file: user_config_path.clone(),
                 trust_anchor,
@@ -336,7 +346,7 @@ pub fn execute_run(args: &RunInput, hooks: &LaunchHooks<'_>) -> Result<i32, RunE
             if let Some(hook) = hooks.on_agent_launch {
                 hook(&marker_dir);
             }
-            let wait_result = wait_with_signal_forwarding(child, backend.kind());
+            let wait_result = governor.supervise(governance_handle, child, backend.kind());
             if let Some(hook) = hooks.on_agent_exit {
                 hook();
             }
@@ -737,6 +747,7 @@ mod tests {
                 fail_closed: true,
             },
             identity_mode: SandboxIdentityMode::SandboxUser,
+            execution_governance: crate::config::ExecutionGovernanceStrategy::Inherited,
             capability: CapabilityLeaseConfig {
                 source: CapabilitySource::Disabled,
                 public_key_path: None,
@@ -810,6 +821,7 @@ mod tests {
                 fail_closed: true,
             },
             identity_mode: SandboxIdentityMode::SandboxUser,
+            execution_governance: crate::config::ExecutionGovernanceStrategy::Inherited,
             capability: CapabilityLeaseConfig {
                 source: CapabilitySource::Disabled,
                 public_key_path: None,
@@ -885,6 +897,7 @@ mod tests {
                 fail_closed: true,
             },
             identity_mode: SandboxIdentityMode::SandboxUser,
+            execution_governance: crate::config::ExecutionGovernanceStrategy::Inherited,
             capability: CapabilityLeaseConfig {
                 source: CapabilitySource::File {
                     path: token_path.clone(),
@@ -938,6 +951,7 @@ mod tests {
                 fail_closed: true,
             },
             identity_mode: SandboxIdentityMode::SandboxUser,
+            execution_governance: crate::config::ExecutionGovernanceStrategy::Inherited,
             capability: CapabilityLeaseConfig {
                 source: CapabilitySource::Disabled,
                 public_key_path: None,
@@ -990,6 +1004,7 @@ mod tests {
                 fail_closed: true,
             },
             identity_mode: SandboxIdentityMode::SandboxUser,
+            execution_governance: crate::config::ExecutionGovernanceStrategy::Inherited,
             capability: CapabilityLeaseConfig {
                 source: CapabilitySource::Disabled,
                 public_key_path: None,
@@ -1081,6 +1096,7 @@ mod tests {
                 fail_closed: true,
             },
             identity_mode: SandboxIdentityMode::SandboxUser,
+            execution_governance: crate::config::ExecutionGovernanceStrategy::Inherited,
             capability: CapabilityLeaseConfig {
                 source: CapabilitySource::Disabled,
                 public_key_path: None,
@@ -1152,6 +1168,7 @@ mod tests {
                 fail_closed: true,
             },
             identity_mode: SandboxIdentityMode::SandboxUser,
+            execution_governance: crate::config::ExecutionGovernanceStrategy::Inherited,
             capability: CapabilityLeaseConfig {
                 source: CapabilitySource::Disabled,
                 public_key_path: None,
@@ -1243,6 +1260,7 @@ mod tests {
                 fail_closed: true,
             },
             identity_mode: SandboxIdentityMode::SandboxUser,
+            execution_governance: crate::config::ExecutionGovernanceStrategy::Inherited,
             capability: CapabilityLeaseConfig {
                 source: CapabilitySource::Disabled,
                 public_key_path: None,
@@ -1317,6 +1335,7 @@ mod tests {
                 fail_closed: true,
             },
             identity_mode: SandboxIdentityMode::SandboxUser,
+            execution_governance: crate::config::ExecutionGovernanceStrategy::Inherited,
             capability: CapabilityLeaseConfig {
                 source: CapabilitySource::Disabled,
                 public_key_path: None,

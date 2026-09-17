@@ -13,4 +13,5 @@ mod execution;
 mod filesystem;
 mod http;
 mod network;
+mod ptrace_seccomp_exec;
 mod support;

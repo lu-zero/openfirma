@@ -105,6 +105,10 @@ pub enum Command {
     #[cfg(target_os = "linux")]
     #[command(name = "__egress-guarded-run", hide = true)]
     EgressGuardedRun(run::EgressGuardedRunArgs),
+    /// Internal in-sandbox `PtraceSeccompExec` exec-gate filter installer + agent runner.
+    #[cfg(target_os = "linux")]
+    #[command(name = "__exec-guarded-run", hide = true)]
+    ExecGuardedRun(run::ExecGuardedRunArgs),
     /// Diagnose a Firma install. Run this first when `firma run` misbehaves.
     Doctor(doctor::Args),
     /// Tail audit decisions and component logs. Use `--source` to switch log streams.

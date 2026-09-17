@@ -2,7 +2,7 @@
 
 ## Artifact metadata
 
-- Status: Accepted (independent plan review complete, all findings corrected — see "Plan-review findings and dispositions")
+- Status: Partially implemented — Slice 1 and Slice 3 (`PtraceSeccompExec`, elaborated by its own child plan) landed; Slice 2 (`LandlockExecute`) and Slice 4 (parametrized coverage/benchmarks) not started. Post-implementation adversarial review of what has landed is required and not yet obtained. (Independent plan review complete pre-implementation, all findings corrected — see "Plan-review findings and dispositions")
 - Durable locator: `docs/architecture/selectable-execution-governance-plan.md` (this file, in-repo)
 - Repository revision researched: `9d761b2b36afa69c32eb1a5cc66e8b9ba45dc34a`
 - Task or requirement source: `~/Sources/openfirma-notes/requirements.md` (Workstream 2), user request to make governance mechanisms selectable at runtime from one binary so Workstream 2 candidates can be benchmarked side by side
@@ -163,6 +163,16 @@ de-risks Slices 1-3.
 - Dependencies: none strictly, but Slice 0 should land first so this slice's `rewrite_launch` insertion lands in the already-clarified rewrite chain rather than the original inline code.
 - Intentionally unsupported: no new governance behavior yet.
 
+#### Slice 1 implementation findings
+
+Implemented and committed (`d0d8eb54`), zero behavior change for existing
+profiles confirmed by the full pre-existing suite passing unchanged.
+`ExecutionGovernor::rewrite_launch` later gained a `sandbox_runtime_dir:
+&Path` parameter beyond what this plan specified, added during Slice 3's
+own implementation once a real strategy (`PtraceSeccompExec`) needed a
+filesystem location reachable from _inside_ the sandbox — see the child
+plan's own Slice 3b findings for why.
+
 ### Slice 2: `LandlockExecute`
 
 - Production, types, tests, and docs/config: new `firma __landlock-guarded-run` subcommand (`DEC-004`) resolving `mediator.allowed_executables` to canonical paths, building a Landlock ruleset restricting `LANDLOCK_ACCESS_FS_EXECUTE` to those paths (deny-by-default elsewhere), `PR_SET_NO_NEW_PRIVS` + `landlock_restrict_self`, then `execve` into the real command; wired via `ExecutionGovernor::rewrite_launch` in `runtime::execute_run`, per `DEC-001`'s corrected insertion point — no `SandboxBackend`/`linux_bwrap/mod.rs` change needed; add the `landlock` crate dependency (version `0.4.4`+, per `~/Sources/hakoniwa`'s known-good pin) to `firma-run`; runtime ABI probe (not kernel-version string matching, per `openfirma-notes/compatibility.md`) to detect support and fail closed with an actionable error otherwise.
@@ -171,6 +181,13 @@ de-risks Slices 1-3.
 - Focused verification: new e2e test — `execution.rs`'s scenario, run under `LandlockExecute`, now asserting the denied child **cannot** execute (kernel-level `EACCES`/`EPERM`), where today it asserts the opposite. Skip (not fail) on kernel <5.13 or when the runtime ABI probe reports Landlock unsupported.
 - Dependencies: Slice 1.
 - Intentionally unsupported: path-based only — cannot distinguish `git status` from `git push` (same binary, different argv); that remains a Sidecar/Cedar-level concern, not this strategy's job.
+
+#### Slice 2 implementation findings
+
+Not started. `PtraceSeccompExec` (Slice 3) was implemented first and
+independently, per this plan's own "Dependencies: Slice 1. Independent of
+Slice 2 — either can ship without the other." `LandlockExecute` remains
+open work; nothing in Slice 3's implementation forecloses it.
 
 ### Slice 3: `PtraceSeccompExec`
 
@@ -181,6 +198,22 @@ de-risks Slices 1-3.
 - Dependencies: Slice 1. Independent of Slice 2 — either can ship without the other.
 - Intentionally unsupported: RHEL-family support is unconfirmed pending the Yama-presence Unknown; ship gated behind an explicit "confirmed platforms" allow-list until verified there, rather than assuming success.
 
+#### Slice 3 implementation findings
+
+Implemented and committed, elaborated by its own child plan
+(`docs/architecture/ptrace-seccomp-exec-gate-plan.md`, Slices 3a/3b/3c) —
+see that document's own per-slice "implementation findings" for the full
+account, including two real bugs a real `bwrap` launch surfaced (a
+mount-namespace-invisible handshake socket, and `sandbox_child_pid`
+attaching to the wrong pid) and the `DEC-016`/`DEC-018` architecture-
+confirmation finding (this session's environment is `aarch64`, not
+`x86_64` as this plan's own text assumed as the default). The FIR-366
+acceptance scenario passes under `PtraceSeccompExec`
+(`ptrace_seccomp_exec_denies_forbidden_tool_as_child_of_allowed_bash_root`)
+while `Inherited`'s own control test continues to fail as expected.
+Post-implementation adversarial review is required (per this plan's own
+"Final verification" below) and not yet obtained.
+
 ### Slice 4: parametrized coverage and Workstream 2 evidence
 
 - Production, types, tests, and docs/config: generalize `execution.rs` into a table-driven or per-strategy-module test run against all three strategies (`Inherited` stays the red control); add a benchmark harness measuring per-strategy exec-latency overhead; produce the Workstream 2 technical finding comparing `Inherited`/`LandlockExecute`/`PtraceSeccompExec` against `requirements.md` §2's evaluation criteria using this slice's real measurements.
@@ -189,6 +222,17 @@ de-risks Slices 1-3.
 - Focused verification: benchmark reproducibility (same profile, repeated runs, bounded variance); the parametrized suite itself is the acceptance check.
 - Dependencies: Slices 1-3 (though can run against however many of Slices 2/3 actually landed — the harness should not hard-require all three to exist).
 - Intentionally unsupported: does not itself decide a winner — per `requirements.md`, that recommendation is a human/team decision informed by this evidence, not automated by this slice.
+
+#### Slice 4 implementation findings
+
+Not started for `PtraceSeccompExec`'s own benchmark numbers yet (Slice 2
+doesn't exist yet, so full three-way parametrization is not yet possible
+either). `openfirma-notes/bench/` already has a reproducible-on-demand
+harness and methodology (`run-benchmarks.sh`, `RESULTS.md`) comparing
+`MicrovmBackend`/`HakoniwaBackend`; extending it with a third,
+`PtraceSeccompExec`-specific measurement (per-`exec()` overhead, since
+this mechanism only traps `execve`/`execveat`, not every syscall) is
+pending follow-up work using that same methodology.
 
 ## Risks and gaps
 
