@@ -286,50 +286,23 @@ pub fn execute_run(args: &RunInput, hooks: &LaunchHooks<'_>) -> Result<i32, RunE
                 .with_capability_token(capability_token.as_deref())
                 .with_capability_source(&profile.capability.source);
 
-            let mut executable = args
-                .command
-                .first()
-                .cloned()
-                .ok_or(RunError::MissingCommand)?;
-            let launch_args = maybe_apply_executable_policy(
+            let target = resolve_launch_target(
+                handle_ref,
                 &profile,
-                &executable,
-                args.command.iter().skip(1).cloned().collect(),
-            );
-            let mut launch_args =
-                maybe_apply_claude_settings(handle_ref, &profile, &executable, launch_args)?;
-            let vscode_state_dir = if vscode::should_apply_vscode_shim(&profile, &executable) {
-                let state_dir = vscode::resolve_vscode_state_dir(
-                    user_config_path.as_deref(),
-                    &handle_ref.runtime_dir,
-                )?;
-                let prepared = vscode::prepare_vscode_shim(
-                    &handle_ref.runtime_dir,
-                    &state_dir,
-                    &executable,
-                    launch_args,
-                    &mut env,
-                    std::env::var_os("PATH").as_deref(),
-                )?;
-                executable = prepared.executable.display().to_string();
-                launch_args = prepared.args;
-                Some(state_dir)
-            } else {
-                None
-            };
-            if let Some(mediator) = &profile.sidecar_local_exec {
-                let canonical = resolve_governed_executable(mediator, &executable)?;
-                enforce_local_command_governance(mediator, &identity, &canonical, &launch_args)?;
-            }
-            if let Some(state_dir) = vscode_state_dir {
+                &identity,
+                user_config_path.as_deref(),
+                &mut env,
+                &args.command,
+            )?;
+            if let Some(state_dir) = &target.vscode_state_dir {
                 let handle_mut = handle
                     .as_mut()
                     .ok_or_else(|| RunError::Internal("sandbox handle missing".to_string()))?;
-                vscode::ensure_vscode_state_mount(handle_mut, &state_dir);
+                vscode::ensure_vscode_state_mount(handle_mut, state_dir);
             }
             let launch = LaunchSpec {
-                executable,
-                args: launch_args,
+                executable: target.executable,
+                args: target.args,
                 cwd: working_dir,
                 env,
                 sidecar_endpoint: effective_endpoint,
@@ -429,6 +402,73 @@ fn ensure_required_session_identity() -> Result<(), RunError> {
     Err(RunError::ConfigValidation(
         "FIRMA_RUN_REQUIRE_SESSION_ID is enabled but FIRMA_RUN_SESSION_ID is not set; set a stable session id so capability issuance/seed selection can match runtime attribution".to_string(),
     ))
+}
+
+/// Resolved executable, arguments, and VS Code state directory for the
+/// wrapped command, after every launch-target rewrite and root-level command
+/// governance have been applied.
+struct ResolvedLaunchTarget {
+    executable: String,
+    args: Vec<String>,
+    vscode_state_dir: Option<PathBuf>,
+}
+
+/// Resolve the wrapped command through the executable-policy, Claude-settings,
+/// and VS Code shim rewrites, then enforce root-level command governance
+/// against the final target.
+///
+/// Consolidates the launch-target rewrite chain into one ordered sequence, so
+/// a future governance mechanism can insert another rewrite step after
+/// governance and before `LaunchSpec` construction without restructuring
+/// `execute_run` itself.
+///
+/// # Errors
+///
+/// Returns an error when the Claude-settings rewrite, the VS Code shim
+/// preparation, or root-level command governance fails.
+fn resolve_launch_target(
+    handle: &crate::backend::SandboxHandle,
+    profile: &ResolvedProfile,
+    identity: &RunIdentity,
+    user_config_path: Option<&Path>,
+    env: &mut BTreeMap<String, String>,
+    command: &[String],
+) -> Result<ResolvedLaunchTarget, RunError> {
+    let mut executable = command.first().cloned().ok_or(RunError::MissingCommand)?;
+    let args = maybe_apply_executable_policy(
+        profile,
+        &executable,
+        command.iter().skip(1).cloned().collect(),
+    );
+    let mut args = maybe_apply_claude_settings(handle, profile, &executable, args)?;
+
+    let vscode_state_dir = if vscode::should_apply_vscode_shim(profile, &executable) {
+        let state_dir = vscode::resolve_vscode_state_dir(user_config_path, &handle.runtime_dir)?;
+        let prepared = vscode::prepare_vscode_shim(
+            &handle.runtime_dir,
+            &state_dir,
+            &executable,
+            args,
+            env,
+            std::env::var_os("PATH").as_deref(),
+        )?;
+        executable = prepared.executable.display().to_string();
+        args = prepared.args;
+        Some(state_dir)
+    } else {
+        None
+    };
+
+    if let Some(mediator) = &profile.sidecar_local_exec {
+        let canonical = resolve_governed_executable(mediator, &executable)?;
+        enforce_local_command_governance(mediator, identity, &canonical, &args)?;
+    }
+
+    Ok(ResolvedLaunchTarget {
+        executable,
+        args,
+        vscode_state_dir,
+    })
 }
 
 fn maybe_apply_executable_policy(
