@@ -50,6 +50,22 @@ pub enum MappingTableError {
         index: usize,
         rule: MappingRuleConfig,
     },
+
+    /// A rule shares an exact `(host, path)` mapping tuple with other rules
+    /// whose combined method coverage already claims every method this
+    /// rule's own pattern could ever match — it can never be the first
+    /// match for any real request. See
+    /// `docs/architecture/mapping-rules-prover-plan.md`, `DEC-002`/`INV-001`.
+    #[error(
+        "rule {index}: unreachable — every method it could match is already claimed by a \
+         higher-priority rule sharing host={:?} path={:?}",
+        rule.host,
+        rule.path.as_deref().unwrap_or_default()
+    )]
+    ShadowedRule {
+        index: usize,
+        rule: MappingRuleConfig,
+    },
 }
 
 /// A validated mapping rule ready for matching.
@@ -116,6 +132,116 @@ impl MappingRule {
     }
 }
 
+/// The eight HTTP methods a matched request can actually reach an
+/// observable decision through. `normalizer::IntentNormalizer::normalize`
+/// denies any matched request whose method isn't one of these
+/// (`HttpMethod::try_from`, checked *after* mapping-table matching,
+/// regardless of which rule matched) — so a mapping rule reachable only via
+/// a method outside this set can never produce an observable envelope
+/// either way, and grounding [`find_shadowed_rule`]'s method universe here
+/// (rather than `firma_http::Method`'s broader, unchecked domain, which
+/// also includes `TRACE`) is the precise choice. See
+/// `docs/architecture/mapping-rules-prover-plan.md`, `DEC-002`.
+const REACHABLE_METHODS: [Method; 8] = [
+    Method::GET,
+    Method::POST,
+    Method::PUT,
+    Method::DELETE,
+    Method::PATCH,
+    Method::HEAD,
+    Method::OPTIONS,
+    Method::CONNECT,
+];
+
+/// Maps a rule's method requirement to the [`REACHABLE_METHODS`] indices it
+/// covers: `None` (any method) covers all eight; `Some(m)` covers just `m`'s
+/// index, or none if `m` isn't one of the eight.
+fn method_indices(method: Option<&Method>) -> Vec<usize> {
+    method.map_or_else(
+        || (0..REACHABLE_METHODS.len()).collect(),
+        |m| {
+            REACHABLE_METHODS
+                .iter()
+                .position(|reachable| reachable == m)
+                .into_iter()
+                .collect()
+        },
+    )
+}
+
+/// Finds a rule that can never be the first match for any real request: one
+/// sharing an exact `(host_pattern, path_pattern)` with other rules whose
+/// combined method coverage, ranked above it by the existing specificity
+/// order, already claims every method it could itself match.
+///
+/// `rules` must already be sorted by descending specificity (as
+/// `MappingTable::from_config` sorts them) — this function does not
+/// re-sort; it trusts and uses the given order directly, both to determine
+/// priority within each exact-tuple group and to return a position stable
+/// against the caller's own indexing of that same order.
+///
+/// Sound in both directions — never misses a real shadowed rule, never
+/// flags a reachable one — but **not** guaranteed to return the
+/// globally-earliest violation when more than one exact-tuple group is
+/// independently shadowed: groups are scanned in order of each group's own
+/// lowest-specificity member, not by each group's own violating position, so
+/// a later group whose lowest member sorts first can be reported ahead of an
+/// earlier one. Callers should treat the returned position as "a shadowed
+/// rule exists, here is one," not "the first one in specificity order."
+///
+/// Deliberately narrower than "no rule is ever shadowed": this proves
+/// nothing about two rules with *different* `(host_pattern, path_pattern)`
+/// strings, regardless of whether one pattern's matching language is a
+/// glob-subset of the other's. See
+/// `docs/architecture/mapping-rules-prover-plan.md`, `DEC-002`/`INV-001`,
+/// for why that broader property is explicitly out of scope rather than
+/// incompletely covered.
+fn find_shadowed_rule<'a>(rules: impl Iterator<Item = &'a MappingRule>) -> Option<usize> {
+    let rules: Vec<&MappingRule> = rules.collect();
+
+    let mut groups: std::collections::HashMap<(&str, Option<&str>), Vec<usize>> =
+        std::collections::HashMap::new();
+    for (position, rule) in rules.iter().enumerate() {
+        groups
+            .entry((rule.host_pattern.as_str(), rule.path_pattern.as_deref()))
+            .or_default()
+            .push(position);
+    }
+
+    // `HashMap` iteration order is unspecified; sort candidate groups by
+    // their lowest member position so the *first* shadowed rule found
+    // (in specificity order) is reported deterministically, not
+    // arbitrarily by hash-bucket order.
+    let mut group_positions: Vec<&Vec<usize>> = groups.values().collect();
+    group_positions.sort_by_key(|positions| positions[0]);
+
+    for positions in group_positions {
+        if positions.len() < 2 {
+            continue; // A group of one can't be shadowed by anything.
+        }
+
+        let mut covered = [false; REACHABLE_METHODS.len()];
+        for &position in positions {
+            let this_rule_methods = method_indices(rules[position].method.as_ref());
+            if this_rule_methods.is_empty() {
+                // No recognized method: this rule can never produce an
+                // observable envelope regardless of shadowing (see
+                // REACHABLE_METHODS) — it neither needs nor grants
+                // coverage.
+                continue;
+            }
+            if this_rule_methods.iter().all(|&m| covered[m]) {
+                return Some(position);
+            }
+            for &m in &this_rule_methods {
+                covered[m] = true;
+            }
+        }
+    }
+
+    None
+}
+
 impl MappingTable {
     /// Load and validate mapping rules from a parsed config.
     ///
@@ -156,7 +282,10 @@ impl MappingTable {
             }
         }
 
-        let mut rules = Vec::with_capacity(file.rules.len());
+        // Paired with each rule's original `file.rules` index so a shadowing
+        // finding (below) can report against the operator-authored config,
+        // the same way `DuplicateRule`/`NonExistingActionClass` do.
+        let mut indexed_rules: Vec<(usize, MappingRule)> = Vec::with_capacity(file.rules.len());
 
         for (i, rule_cfg) in file.rules.iter().enumerate() {
             if !registry.contains(&rule_cfg.action_class) {
@@ -173,17 +302,31 @@ impl MappingTable {
                 rule_cfg.path.as_ref(),
             );
 
-            rules.push(MappingRule {
-                method: rule_cfg.method.clone(),
-                host_pattern,
-                path_pattern: rule_cfg.path.clone(),
-                action_class: rule_cfg.action_class.clone(),
-                specificity,
-            });
+            indexed_rules.push((
+                i,
+                MappingRule {
+                    method: rule_cfg.method.clone(),
+                    host_pattern,
+                    path_pattern: rule_cfg.path.clone(),
+                    action_class: rule_cfg.action_class.clone(),
+                    specificity,
+                },
+            ));
         }
 
         // Sort by descending specificity (most specific first)
-        rules.sort_by_key(|rule| std::cmp::Reverse(rule.specificity));
+        indexed_rules.sort_by_key(|(_, rule)| std::cmp::Reverse(rule.specificity));
+
+        if let Some(shadowed_index) = find_shadowed_rule(indexed_rules.iter().map(|(_, rule)| rule))
+        {
+            let (original_index, _) = indexed_rules[shadowed_index];
+            return Err(MappingTableError::ShadowedRule {
+                index: original_index,
+                rule: file.rules[original_index].clone(),
+            });
+        }
+
+        let rules = indexed_rules.into_iter().map(|(_, rule)| rule).collect();
 
         Ok(Self {
             rules,
@@ -491,5 +634,130 @@ mod tests {
     fn glob_match_path_wildcard() {
         assert!(glob_match("/v1/*/completions", "/v1/chat/completions"));
         assert!(!glob_match("/v1/*/completions", "/v2/chat/completions"));
+    }
+
+    fn rule(method: Option<Method>, action_class: &str) -> MappingRuleConfig {
+        MappingRuleConfig {
+            method,
+            host: "api.example.com".to_string(),
+            path: Some("/widgets".to_string()),
+            action_class: action_class.to_string(),
+        }
+    }
+
+    #[test]
+    fn any_method_rule_shadowed_when_every_method_is_covered() {
+        // Eight higher-priority rules, one per REACHABLE_METHODS entry,
+        // sharing the exact (host, path) tuple with a lower-priority
+        // any-method rule -- none of these individually duplicates any
+        // other (different method each), so `DuplicateRule` does not
+        // fire, but their union already claims every method the
+        // any-method rule could ever match.
+        let mut rules: Vec<MappingRuleConfig> = REACHABLE_METHODS
+            .iter()
+            .map(|m| rule(Some(m.clone()), "filesystem.read"))
+            .collect();
+        rules.push(rule(None, "communication.external.send"));
+        let file = MappingRulesFile { rules };
+
+        let err = MappingTable::from_config(&file, &ActionClassRegistry::v0_1(), true).unwrap_err();
+        assert_matches!(
+            err,
+            MappingTableError::ShadowedRule { index: 8, ref rule }
+                if rule.action_class == "communication.external.send"
+        );
+    }
+
+    #[test]
+    fn any_method_rule_not_shadowed_when_one_method_is_uncovered() {
+        // Same shape, but CONNECT is left uncovered -- the any-method rule
+        // remains reachable via a CONNECT request, so it must not be
+        // rejected.
+        let mut rules: Vec<MappingRuleConfig> = REACHABLE_METHODS
+            .iter()
+            .filter(|m| **m != Method::CONNECT)
+            .map(|m| rule(Some(m.clone()), "filesystem.read"))
+            .collect();
+        rules.push(rule(None, "communication.external.send"));
+        let file = MappingRulesFile { rules };
+
+        MappingTable::from_config(&file, &ActionClassRegistry::v0_1(), true)
+            .expect("any-method rule is reachable via the uncovered CONNECT method");
+    }
+
+    #[test]
+    fn different_host_or_path_never_counts_as_shadowing() {
+        // Same any-method rule as the shadowed case, but the eight
+        // covering rules target a DIFFERENT path -- INV-001 is deliberately
+        // scoped to exact (host, path) tuples only (DEC-002), so this must
+        // succeed even though the any-method rule's host wildcard would,
+        // under a general containment reading, arguably overlap.
+        let mut rules: Vec<MappingRuleConfig> = REACHABLE_METHODS
+            .iter()
+            .map(|m| MappingRuleConfig {
+                method: Some(m.clone()),
+                host: "api.example.com".to_string(),
+                path: Some("/gadgets".to_string()),
+                action_class: "filesystem.read".to_string(),
+            })
+            .collect();
+        rules.push(rule(None, "communication.external.send"));
+        let file = MappingRulesFile { rules };
+
+        MappingTable::from_config(&file, &ActionClassRegistry::v0_1(), true)
+            .expect("different path means no shadowing is claimed, by design (DEC-002)");
+    }
+
+    /// Independent re-derivation of shadowing, deliberately not sharing
+    /// [`find_shadowed_rule`]'s running-bitset implementation: for each
+    /// rule in priority order, it is reachable iff at least one concrete
+    /// method it requires was not already required by some earlier rule.
+    fn oracle_first_shadowed(rules: &[MappingRule]) -> Option<usize> {
+        for (i, candidate) in rules.iter().enumerate() {
+            let candidate_methods = method_indices(candidate.method.as_ref());
+            if candidate_methods.is_empty() {
+                continue;
+            }
+            let fully_covered = candidate_methods.iter().all(|&m| {
+                rules[..i]
+                    .iter()
+                    .any(|earlier| method_indices(earlier.method.as_ref()).contains(&m))
+            });
+            if fully_covered {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    fn arbitrary_method_requirement() -> impl proptest::strategy::Strategy<Value = Option<Method>> {
+        use proptest::prelude::*;
+        prop_oneof![
+            Just(None),
+            (0..REACHABLE_METHODS.len()).prop_map(|i| Some(REACHABLE_METHODS[i].clone())),
+        ]
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn shadowing_matches_independent_oracle(
+            requirements in proptest::collection::vec(arbitrary_method_requirement(), 1..12)
+        ) {
+            let rules: Vec<MappingRule> = requirements
+                .into_iter()
+                .enumerate()
+                .map(|(i, method)| MappingRule {
+                    method,
+                    host_pattern: "api.example.com".to_string(),
+                    path_pattern: Some("/widgets".to_string()),
+                    action_class: format!("rule-{i}"),
+                    specificity: 0,
+                })
+                .collect();
+
+            let actual = find_shadowed_rule(rules.iter());
+            let expected = oracle_first_shadowed(&rules);
+            proptest::prop_assert_eq!(actual, expected);
+        }
     }
 }

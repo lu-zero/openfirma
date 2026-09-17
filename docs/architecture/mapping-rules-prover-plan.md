@@ -89,9 +89,9 @@
   this plan establishes two invariants (`INV-001`, `INV-002`) that do not
   exist today (research confirmed no test proves rule-reachability or
   registry-coverage properties, only example-based cases); (6) multiple
-  viable designs with material tradeoffs — glob-subsumption via a bespoke
-  decision procedure vs. Z3 string/regex theory (`DEC-002`), and CLI surface
-  as a new `firma mapping` command vs. extending `firma policy validate`
+  viable designs with material tradeoffs — exact-tuple-grouping vs. general
+  glob containment vs. Z3 string/regex theory (`DEC-002`), and CLI surface
+  as a new `firma mapping-rules` command vs. extending `firma policy validate`
   (`DEC-004`).
 - Higher-mode triggers checked: none apply beyond Full (no distributed/
   concurrency/migration/multi-crate-with-substantial-uncertainty shape).
@@ -130,7 +130,7 @@
   glob pattern (`glob_match`, re-exported from `firma-secret-provider`,
   `*`-only wildcard semantics) matches the request
   (`find_match`, `mapping.rs:196-213`). Because sorting is global and matching
-  is first-match-wins, a lower-specificity rule is *reachable* only if some
+  is first-match-wins, a lower-specificity rule is _reachable_ only if some
   concrete request exists that its own pattern matches and every
   higher-priority rule's pattern does not — this is a real, currently
   unverified correctness property, not merely a duplicate-key check.
@@ -153,7 +153,7 @@
 - Rationale and evidence: `Current behavior and problem` traces a mapping
   match to a `NormalizedEnvelope`, never directly to `Allow`. OpenShell's own
   categories (credential reach, capability expansion) are meaningful there
-  because its Landlock/seccomp layer's classification *is* the enforcement
+  because its Landlock/seccomp layer's classification _is_ the enforcement
   decision; openfirma's is not.
 - Consequences and rejected alternatives: rejected reframing OpenShell's
   `credential_reach_expansion`/`l7_bypass_credentialed` categories onto the
@@ -163,47 +163,68 @@
   outcomes require Cedar-policy reasoning and are explicitly out of scope
   (see `~/Sources/openfirma-notes/notes/openshell-z3-prover.md`, claims 1-3).
 
-### `DEC-002`: Hand-rolled, two-phase decision procedure, not an SMT dependency — scope narrowed after plan review (`PLAN-002`)
+### `DEC-002`: Exact-tuple equality grouping plus method-set union, not general glob containment or an SMT dependency — refined twice: after plan review (`PLAN-002`), then during implementation
 
-- Choice: implement `INV-001`'s shadowing check as a two-phase decision
-  procedure over this repo's own glob dialect, not by adding Z3 (or any SMT
-  solver) for string/regex containment: (1) pairwise host/path pattern
-  containment — does every string a lower-priority rule's host/path pattern
-  matches also match some specific higher-priority rule's host/path pattern?
-  — followed by (2) a set-union check over `firma_http::Method`'s closed,
-  9-value enum: for candidate rule R with method requirement `M_r` (`None`
-  meaning "any", `Some(m)` meaning exactly `m`), collect every higher-priority
-  rule whose host/path pattern contains R's per phase (1), union their method
-  coverage (`None` contributes all 9 values), and check the union is a
-  superset of `M_r`'s requirement.
+- Choice: implement `INV-001`'s shadowing check as: (1) group rules by exact
+  string equality of `(host_pattern, path_pattern)` — no glob interpretation
+  at this step, a literal tuple comparison; (2) within each group, order by
+  the existing specificity score and check whether the union of
+  higher-priority rules' method coverage (`None` contributing all of
+  `firma_core::HttpMethod`'s 8 closed variants, `Some(m)` contributing just
+  `m`) is a superset of each lower-priority rule's own method requirement in
+  that same group.
 - Rationale and evidence: plan review (`PLAN-002`) found the original
   single-pattern-pairwise framing insufficient — it constructed a concrete,
-  realistic witness: N higher-priority rules, one per `Method` value, sharing
+  realistic witness: N higher-priority rules, one per method value, sharing
   an identical wildcard host/path pattern, jointly (not individually) shadow
-  a lower-priority any-method rule with the same pattern. `github.toml`'s
-  real shape (52 of 54 rules specify a method, 2 don't, on overlapping
-  host/path patterns) makes this a realistic case, not a hypothetical one.
-  The corrected two-phase procedure catches it: phase 1 (host/path
-  containment, still decidable in low-degree polynomial time by direct
-  segment comparison over the `*`-only star-language grammar,
-  `mapping.rs:474-494`) is unchanged from the original claim; phase 2 (method
-  coverage) is a small, closed-enum set-union, itself trivially decidable.
+  a lower-priority any-method rule with the same pattern. Implementing the
+  reviewer's own suggested fix (general pairwise host/path _containment_,
+  e.g. does `*.github.com` contain `api.github.com`) turned out to need real
+  automaton-based reasoning once path patterns were inspected directly: the
+  shipped `config/mappings/*.toml` files have host patterns that are always
+  exact (zero wildcards, confirmed by direct inspection) but path patterns
+  with up to 4 wildcards each (e.g. `/repos/*/*/pulls/*/reviews/*/events`) —
+  general containment between two _different_ multi-wildcard patterns is a
+  genuine language-containment problem, not "direct segment comparison" as
+  first claimed. Exact-tuple-equality grouping sidesteps this entirely: it
+  needs no pattern interpretation at all, and directly targets the reviewer's
+  own witness shape, which is also confirmed _real and common_ in the
+  shipped config — direct inspection found 30+ exact `(host, path)` tuples
+  already shared by multiple rules differing only by method (e.g.
+  `api.stripe.com`+`/v1/charges`: `GET`→`payment.read`, `POST`→
+  `payment.transfer`), none of which currently include a `None`-method rule
+  (so nothing is shadowed today), but any future rule addition to such a
+  group using `method = None` would be exactly the case this check exists to
+  catch.
+  Grounding on `HttpMethod` rather than `firma_http::Method`'s 9 named
+  constants is also a refinement found during implementation: `Method` wraps
+  the open `http::Method` (any HTTP token is technically acceptable in TOML),
+  but `normalizer/mod.rs:303`'s `HttpMethod::try_from` — which runs _after_
+  mapping-table matching, only in the `Matched` arm — denies any request
+  whose method isn't one of `HttpMethod`'s 8 closed variants, regardless of
+  which rule matched. A rule reachable only via a method outside that set
+  can never produce an observable envelope either way, so grounding
+  reachability in the 8-value set is the precise, evidence-backed choice.
 - Consequences and rejected alternatives: rejected Z3 string/regex theory —
-  same reasoning as before (dependency weight vs. a grammar simple enough for
-  a hand-written decision procedure), but the completeness claim is now
-  explicitly **narrower** than originally stated: this procedure proves
-  `INV-001` only for shadowing that decomposes into (host/path containment)
-  × (method-set union) — it does **not** prove the fully general case where a
-  rule is shadowed by the union of several higher-priority rules with
-  genuinely *different, non-identical* host/path patterns (each covering only
-  part of the lower rule's domain), which would require automaton-based
-  language-union containment (NFA/DFA construction and minimization), a
-  materially larger algorithm this plan does not build. `INV-001`'s semantic
-  predicate and `TRACE-001`/proof-obligation "Limits" are updated to disclose
-  this explicitly rather than overclaim full reachability proof. **Still
-  flagged as this plan's least-confident decision** (see `Risks and gaps`),
-  now specifically because of this narrowed-but-real scope, not just generic
-  hand-rolled-algorithm risk.
+  same dependency-weight reasoning as before, now more clearly justified:
+  the _actually implemented_ check needs no string-theory reasoning at all.
+  Rejected general pairwise glob containment (the `PLAN-002`-era design) —
+  correct in principle but requires automaton construction for multi-wildcard
+  path patterns, disproportionate to what the exact-tuple-equality
+  alternative already proves for a real, present pattern. The completeness
+  claim is consequently narrower than either prior version: this procedure
+  proves `INV-001` **only** for rules sharing an _exact_ `(host_pattern,
+  path_pattern)` string with at least one other rule — it proves nothing
+  about shadowing across two _different_ patterns (whether or not one's
+  language is a subset of the other's), which remains fully out of scope,
+  not merely incompletely covered. `INV-001`'s semantic predicate and
+  `TRACE-001`/proof-obligation "Limits" reflect this precise, narrower scope.
+  **Still flagged as this plan's least-confident decision** (see `Risks and
+  gaps`) only insofar as the exact-tuple scope may prove too narrow to be
+  useful in practice if real shadowing bugs turn out to occur across
+  genuinely different patterns rather than within exact-tuple groups — the
+  shipped-config inspection above is evidence, not proof, that the narrower
+  scope is where real bugs would occur.
 
 ### `DEC-003`: `INV-001` is fail-closed and startup-blocking; `INV-002` is advisory and CLI-only
 
@@ -242,7 +263,7 @@
   profile-relative multi-file merge) under one subcommand. Originally named
   `firma mapping validate`; plan review (`PLAN-004`) found this collides with
   the existing `--mapping` flag on `firma config` (`args/config.rs:64`,
-  selecting a built-in mapping *template* to scaffold — a different concept)
+  selecting a built-in mapping _template_ to scaffold — a different concept)
   and `firma policy list`'s "Mappings (--mapping, repeatable)" output
   section. Renamed to `firma mapping-rules validate` to avoid the collision.
 
@@ -337,16 +358,19 @@
   finding library function, reused by both a startup loader and a CLI
   subcommand).
 
-### `INV-001`: Every configured mapping rule is reachable, for the shadowing shapes `DEC-002`'s procedure decides
+### `INV-001`: Every rule sharing an exact host/path tuple with another rule has a reachable method
 
-- Semantic predicate (narrowed after `PLAN-002`): for every rule R in the
-  merged rule set, R is not shadowed by any single higher-priority rule whose
-  host/path pattern contains R's own, nor by the union of higher-priority
-  rules whose host/path patterns each contain R's own and whose `Method`
-  coverage jointly is a superset of R's method requirement. This does **not**
-  prove reachability against shadowing by a union of higher-priority rules
-  with *different, non-identical* host/path patterns (`DEC-002`) — that case
-  is an explicit, disclosed limitation, not silently treated as covered.
+- Semantic predicate (narrowed twice — after `PLAN-002`, then during
+  implementation, `DEC-002`): group merged rules by exact string equality of
+  `(host_pattern, path_pattern)`. Within each group, order by specificity;
+  for every rule R in a group, some higher-priority rule in the _same group_
+  must exist whose method requirement is `None` (any) or equals R's own —
+  otherwise R's method requirement is uncovered by anything ranked before it
+  within its group and R is unreachable within `HttpMethod`'s closed 8-value
+  method universe. This proves nothing about shadowing across two rules with
+  _different_ `(host_pattern, path_pattern)` strings, whether or not one
+  pattern's language is a glob-subset of the other's — that case is fully
+  out of scope, not an incompletely-covered edge of this check.
 - Primary owner: `MappingTable::from_config`, extending its existing
   validation (alongside `DuplicateRule` and unknown-action-class rejection).
 - Detailed proof: `TRACE-001` (Technical evidence).
@@ -386,17 +410,28 @@
 - Production, types, tests, and docs/config: add
   `MappingTableError::ShadowedRule { rule: MappingRuleId, shadowed_by:
   Vec<MappingRuleId> }` (or equivalent descriptive fields) and the
-  glob-subsumption decision procedure, invoked from inside
-  `MappingTable::from_config` immediately after the existing duplicate-tuple
-  check. Unit tests: a constructed rule set with a deliberately shadowed
-  wildcard rule (must fail), a rule set where two overlapping wildcard rules
-  each still have a genuinely reachable subset (must pass), and
-  property-based tests (via the workspace's existing `proptest` dependency)
-  generating random small rule sets and cross-checking the decision
-  procedure's answer against a brute-force enumerative oracle over a bounded
-  concrete-string domain. Integration test: `build_pipeline_runtime` given a
-  fixture config with a shadowed rule returns an `Err` naming the shadowed
-  rule.
+  exact-tuple-equality-group-plus-method-union check (`DEC-002`), invoked
+  from inside `MappingTable::from_config` immediately after the existing
+  duplicate-tuple check. Unit tests: a constructed rule group sharing one
+  exact `(host, path)` where a `None`-method rule is fully shadowed by the
+  union of method-specific rules ranked above it (must fail), the same
+  shape with one method left uncovered (must pass), and property-based
+  tests (via the workspace's existing `proptest` dependency) generating
+  random small rule sets — varying rule _count_ and method combinations
+  per group, not just single pairs, so the generator actually exercises
+  joint coverage rather than reproducing `PLAN-002`'s own blind spot — and
+  cross-checking the decision procedure's answer against a brute-force
+  enumerative oracle over `HttpMethod`'s 8 closed values. Integration test:
+  `MappingTable::from_config` given a fixture config with a shadowed rule
+  returns an `Err` naming the shadowed rule — **corrected after
+  post-implementation review**: originally planned one level higher, at
+  `build_pipeline_runtime`, but no other `MappingTableError` variant
+  (including the pre-existing `DuplicateRule`) is tested at that level
+  either, and `build_pipeline_runtime` calls `from_config` directly with no
+  intervening logic, so the risk left uncovered by testing one level lower
+  is negligible — matching existing precedent rather than adding a novel,
+  redundant integration layer this repo doesn't otherwise use for this
+  error type.
 - Affected decisions and traces: `DEC-001`, `DEC-002`, `DEC-003`; `TRACE-001`.
 - Proof obligations: `INV-001`.
 - Focused verification: `cargo nextest run -p firma-sidecar -E
@@ -447,7 +482,7 @@
   today) or wrongly reject a valid rule set (false positive, an availability
   regression at startup). Mitigated, not eliminated, by Slice 1's
   property-based cross-check against a brute-force oracle — the oracle's
-  generator must vary rule *counts* and method combinations, not just
+  generator must vary rule _counts_ and method combinations, not just
   single-pattern pairs, or it would reproduce `PLAN-002`'s own blind spot
   instead of catching it.
 - Planned mitigations: property-based testing (above), explicitly generating
@@ -462,7 +497,7 @@
   hatch for `INV-001` (`Scope`'s open decision) is unresolved pending
   reviewer/user input. `INV-001`'s corrected algorithm (`DEC-002`) is now
   explicitly known-incomplete for shadowing via a union of higher-priority
-  rules with *different* host/path patterns — not a silent gap, but a real
+  rules with _different_ host/path patterns — not a silent gap, but a real
   one: such a rule set would pass `INV-001` today without actually being
   proven reachable.
 - Least-confident decisions: `DEC-002` (bespoke two-phase algorithm vs. Z3
@@ -542,7 +577,7 @@ disposition:
   segment comparison") is sufficient to implement `INV-001`.
 - Evidence: `DEC-002`'s rationale frames the algorithm as pairwise pattern
   containment, but `INV-001`'s semantic predicate requires that a rule's
-  matching set be covered by the *union* of all higher-priority rules, not
+  matching set be covered by the _union_ of all higher-priority rules, not
   any single one. Concrete witness: `firma_http::Method` is a small closed
   set; N higher-priority rules, one per method, identical wildcard host/path,
   jointly (not individually) shadow a lower-priority any-method rule with the
@@ -622,7 +657,7 @@ disposition:
   new `firma mapping` top-level subcommand doesn't conflict with existing CLI
   terminology.
 - Evidence: `firma config --mapping` already exists (selects a built-in
-  mapping *template* to scaffold, `args/config.rs:64`); `firma policy list`
+  mapping _template_ to scaffold, `args/config.rs:64`); `firma policy list`
   already prints a "Mappings (--mapping, repeatable)" section. The proposed
   `firma mapping validate` introduces a new top-level noun "mapping" meaning
   something different from both existing uses.
@@ -669,24 +704,24 @@ resolving `PLAN-003` is now recorded explicitly (`DEC-007`).
 
 ### Applicability assessment
 
-| Section                     | Applicability   | Reason or evidence |
-| ---------------------------- | --------------- | ------------------- |
-| Vocabulary                  | Applicable       | "shadowed rule," "reachable," "orphaned class" are new terms this plan introduces |
-| Alternatives                | Applicable       | `DEC-002`, `DEC-003`, `DEC-004` each have a material rejected alternative |
-| File-tree diff              | Applicable       | new files in `firma-sidecar` and `firma` |
-| Type and signature sketches | Applicable       | `MappingFinding`-shaped types are new |
-| Semantic call traces        | Applicable       | startup and CLI paths both change |
-| Trust analysis              | Applicable       | fail-closed startup behavior is a trust-relevant path |
-| Detailed proof obligations  | Applicable       | `INV-001`/`INV-002` need explicit proof-boundary records |
+| Section                     | Applicability | Reason or evidence                                                                |
+| --------------------------- | ------------- | --------------------------------------------------------------------------------- |
+| Vocabulary                  | Applicable    | "shadowed rule," "reachable," "orphaned class" are new terms this plan introduces |
+| Alternatives                | Applicable    | `DEC-002`, `DEC-003`, `DEC-004` each have a material rejected alternative         |
+| File-tree diff              | Applicable    | new files in `firma-sidecar` and `firma`                                          |
+| Type and signature sketches | Applicable    | `MappingFinding`-shaped types are new                                             |
+| Semantic call traces        | Applicable    | startup and CLI paths both change                                                 |
+| Trust analysis              | Applicable    | fail-closed startup behavior is a trust-relevant path                             |
+| Detailed proof obligations  | Applicable    | `INV-001`/`INV-002` need explicit proof-boundary records                          |
 
 ### Conditional: Vocabulary
 
-| Canonical term | Meaning | Owner/context | Synonyms or terms to avoid | Conflict or decision |
-| --- | --- | --- | --- | --- |
-| Shadowed rule | A configured mapping rule whose pattern is fully subsumed by one or more higher-priority rules, so it can never match a real request | `MappingTable::from_config` | "dead rule," "unreachable rule" (avoid — "shadowed" is used consistently in this plan) | `DEC-001`, `DEC-002` |
-| Orphaned action class | A registry class with no static mapping rule, no Composio catalog entry, and no dynamic-reclassification exemption producing it — excludes classes used only by `firma-run`'s local execution-governance config, which this term deliberately does not describe | `check_registry_reachability` | "unused class," "dead class" (avoid — "orphaned" distinguishes it from `risk_level`'s unrelated dead-code status) | `DEC-005`, `DEC-006` |
-| Sensitivity | Deliberately NOT introduced by this plan — `risk_level` remains unconsumed metadata outside this checker's scope | N/A | Do not conflate with `INV-001`/`INV-002`, which don't consult `risk_level` at all | Scope |
-| `firma mapping-rules validate` | The new CLI subcommand this plan adds | `crates/firma/src/args/mapping_rules.rs` | Avoid confusing with `firma config --mapping` (selects a built-in mapping *template* to scaffold) or `firma policy list`'s "Mappings" section — same word, different concept, collision confirmed and resolved by renaming (`DEC-004`, `PLAN-004`) | `DEC-004` |
+| Canonical term                 | Meaning                                                                                                                                                                                                                                                         | Owner/context                            | Synonyms or terms to avoid                                                                                                                                                                                                                         | Conflict or decision |
+| ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------- |
+| Shadowed rule                  | A configured mapping rule whose pattern is fully subsumed by one or more higher-priority rules, so it can never match a real request                                                                                                                            | `MappingTable::from_config`              | "dead rule," "unreachable rule" (avoid — "shadowed" is used consistently in this plan)                                                                                                                                                             | `DEC-001`, `DEC-002` |
+| Orphaned action class          | A registry class with no static mapping rule, no Composio catalog entry, and no dynamic-reclassification exemption producing it — excludes classes used only by `firma-run`'s local execution-governance config, which this term deliberately does not describe | `check_registry_reachability`            | "unused class," "dead class" (avoid — "orphaned" distinguishes it from `risk_level`'s unrelated dead-code status)                                                                                                                                  | `DEC-005`, `DEC-006` |
+| Sensitivity                    | Deliberately NOT introduced by this plan — `risk_level` remains unconsumed metadata outside this checker's scope                                                                                                                                                | N/A                                      | Do not conflate with `INV-001`/`INV-002`, which don't consult `risk_level` at all                                                                                                                                                                  | Scope                |
+| `firma mapping-rules validate` | The new CLI subcommand this plan adds                                                                                                                                                                                                                           | `crates/firma/src/args/mapping_rules.rs` | Avoid confusing with `firma config --mapping` (selects a built-in mapping _template_ to scaffold) or `firma policy list`'s "Mappings" section — same word, different concept, collision confirmed and resolved by renaming (`DEC-004`, `PLAN-004`) | `DEC-004`            |
 
 ### Conditional: Alternatives
 
@@ -751,7 +786,7 @@ pub(crate) fn find_shadowed_rules(rules: &MappingRulesFile) -> Vec<MappingFindin
 /// One shipped Composio catalog (`config/composio/*.mapping.json`),
 /// mapping a provider tool slug to the `action_class` it produces —
 /// a second producer INV-002 must consult, alongside `rules`.
-pub struct ComposioMappingCatalog { /* .. */ }
+pub struct ComposioMappingCatalog {/* .. */}
 
 /// Returns every INV-002 violation — classes in `registry` that neither
 /// `rules` nor any `catalogs` entry produces and that aren't in the DEC-005
@@ -768,37 +803,37 @@ pub fn find_orphaned_action_classes(
 
 ### Conditional: Semantic call traces
 
-| Field | Content |
-| --- | --- |
-| Trace ID | `TRACE-001` |
-| State | Proposed |
-| Entry and stimulus | `firma-sidecar` process startup with a `firma.toml` whose merged mapping-rule files contain a shadowed rule |
-| Path | `build_pipeline_runtime → load_mapping_rules → MappingTable::from_config → find_shadowed_rules → MappingTableError::ShadowedRule → anyhow::Error → process exit before serving traffic` |
-| Input/output types | `MappingRulesFile → Result<MappingTable, MappingTableError>` |
-| Validation/trust crossings | None new — same load-time trust boundary as the existing `DuplicateRule`/unknown-action-class checks (operator-authored config, already-trusted input) |
-| Invariant established | `INV-001` |
-| Invariant assumed | Downstream: none — this is a load-time gate, nothing downstream assumes reachability beyond "the process either started or didn't" |
-| Success outcome | No shadowed rules → `Ok(MappingTable)`, startup proceeds unchanged from today |
-| Failure path | Fail-closed abort, identical shape to `DuplicateRule` |
-| Evidence | New unit tests (constructed shadowed-rule fixture, property-based cross-check) + new integration test on `build_pipeline_runtime` |
-| Proof boundary | Unit (algorithm) + integration (startup wiring) |
-| Unknowns | Whether an operator override is wanted (`Scope`'s open decision) |
+| Field                      | Content                                                                                                                                                                                                                    |
+| -------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Trace ID                   | `TRACE-001`                                                                                                                                                                                                                |
+| State                      | Landed (Slice 1, `1a6b14e9`)                                                                                                                                                                                               |
+| Entry and stimulus         | `firma-sidecar` process startup with a `firma.toml` whose merged mapping-rule files contain a shadowed rule                                                                                                                |
+| Path                       | `build_pipeline_runtime → load_mapping_rules → MappingTable::from_config → find_shadowed_rules → MappingTableError::ShadowedRule → anyhow::Error → process exit before serving traffic`                                    |
+| Input/output types         | `MappingRulesFile → Result<MappingTable, MappingTableError>`                                                                                                                                                               |
+| Validation/trust crossings | None new — same load-time trust boundary as the existing `DuplicateRule`/unknown-action-class checks (operator-authored config, already-trusted input)                                                                     |
+| Invariant established      | `INV-001`                                                                                                                                                                                                                  |
+| Invariant assumed          | Downstream: none — this is a load-time gate, nothing downstream assumes reachability beyond "the process either started or didn't"                                                                                         |
+| Success outcome            | No shadowed rules → `Ok(MappingTable)`, startup proceeds unchanged from today                                                                                                                                              |
+| Failure path               | Fail-closed abort, identical shape to `DuplicateRule`                                                                                                                                                                      |
+| Evidence                   | New unit tests (constructed shadowed-rule fixture, property-based cross-check) + new integration test on `MappingTable::from_config` (not `build_pipeline_runtime` — corrected post-review, see the note in Slice 1 above) |
+| Proof boundary             | Unit (algorithm) + integration (`MappingTable::from_config`)                                                                                                                                                               |
+| Unknowns                   | Whether an operator override is wanted (`Scope`'s open decision)                                                                                                                                                           |
 
-| Field | Content |
-| --- | --- |
-| Trace ID | `TRACE-002` |
-| State | Proposed |
-| Entry and stimulus | Operator runs `firma mapping-rules validate --config <firma.toml>` |
-| Path | `firma mapping-rules validate → firma_sidecar::load_mapping_rules (now pub, DEC-007) → MappingTable::from_config (INV-001, as errors) → find_orphaned_action_classes(rules, composio_catalogs, registry) (INV-002, as warnings) → render report → exit 0 if no errors, 1 if any error (warnings never affect exit code)` |
-| Input/output types | `PathBuf (config) → Vec<MappingFinding> → process exit code` |
-| Validation/trust crossings | None — offline tool, operator-invoked, same trust level as `firma policy validate` |
-| Invariant established | `INV-002` (advisory) |
-| Invariant assumed | None downstream |
-| Success outcome | Report printed; exit 0 if no `INV-001` violations (warnings may still be present) |
-| Failure path | Exit 1 if any `INV-001` violation; warnings are always non-fatal |
-| Evidence | New CLI black-box integration test |
-| Proof boundary | CLI integration test |
-| Unknowns | None material |
+| Field                      | Content                                                                                                                                                                                                                                                                                                                  |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Trace ID                   | `TRACE-002`                                                                                                                                                                                                                                                                                                              |
+| State                      | Proposed                                                                                                                                                                                                                                                                                                                 |
+| Entry and stimulus         | Operator runs `firma mapping-rules validate --config <firma.toml>`                                                                                                                                                                                                                                                       |
+| Path                       | `firma mapping-rules validate → firma_sidecar::load_mapping_rules (now pub, DEC-007) → MappingTable::from_config (INV-001, as errors) → find_orphaned_action_classes(rules, composio_catalogs, registry) (INV-002, as warnings) → render report → exit 0 if no errors, 1 if any error (warnings never affect exit code)` |
+| Input/output types         | `PathBuf (config) → Vec<MappingFinding> → process exit code`                                                                                                                                                                                                                                                             |
+| Validation/trust crossings | None — offline tool, operator-invoked, same trust level as `firma policy validate`                                                                                                                                                                                                                                       |
+| Invariant established      | `INV-002` (advisory)                                                                                                                                                                                                                                                                                                     |
+| Invariant assumed          | None downstream                                                                                                                                                                                                                                                                                                          |
+| Success outcome            | Report printed; exit 0 if no `INV-001` violations (warnings may still be present)                                                                                                                                                                                                                                        |
+| Failure path               | Exit 1 if any `INV-001` violation; warnings are always non-fatal                                                                                                                                                                                                                                                         |
+| Evidence                   | New CLI black-box integration test                                                                                                                                                                                                                                                                                       |
+| Proof boundary             | CLI integration test                                                                                                                                                                                                                                                                                                     |
+| Unknowns                   | None material                                                                                                                                                                                                                                                                                                            |
 
 ### Conditional: Trust analysis
 
@@ -823,32 +858,32 @@ pub fn find_orphaned_action_classes(
 
 ### Conditional: Proof obligations
 
-| Field | Content |
-| --- | --- |
-| Invariant | `INV-001` |
-| Kind | Runtime (load-time) |
-| Owner/proof boundary | `MappingTable::from_config` |
-| Suite/boundary | Unit + integration |
-| Stimulus | A merged rule set with a rule fully subsumed by higher-priority rules |
-| Observable effects | `Err(MappingTableError::ShadowedRule)`, startup aborts |
-| Controls/substitutions | Constructed in-memory `MappingRulesFile` fixtures; property-based random generation |
-| Failure cases | The shadowing algorithm itself failing to detect a real case (false negative) or over-flagging a valid rule (false positive) |
-| Evidence | New tests, Slice 1 |
-| Status | Planned |
-| Slice | 1 |
-| Limits | Proves reachability against this repo's exact glob dialect only, and only for shadowing that decomposes into (host/path containment) × (method-set union) — does **not** prove reachability against a union of higher-priority rules with different, non-identical host/path patterns (`DEC-002`); does not prove anything about Cedar-level outcomes |
+| Field                  | Content                                                                                                                                                                                                                                                                                                                                                                                |
+| ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Invariant              | `INV-001`                                                                                                                                                                                                                                                                                                                                                                              |
+| Kind                   | Runtime (load-time)                                                                                                                                                                                                                                                                                                                                                                    |
+| Owner/proof boundary   | `MappingTable::from_config`                                                                                                                                                                                                                                                                                                                                                            |
+| Suite/boundary         | Unit + integration                                                                                                                                                                                                                                                                                                                                                                     |
+| Stimulus               | A merged rule set with a rule fully subsumed by higher-priority rules                                                                                                                                                                                                                                                                                                                  |
+| Observable effects     | `Err(MappingTableError::ShadowedRule)`, startup aborts                                                                                                                                                                                                                                                                                                                                 |
+| Controls/substitutions | Constructed in-memory `MappingRulesFile` fixtures; property-based random generation                                                                                                                                                                                                                                                                                                    |
+| Failure cases          | The shadowing algorithm itself failing to detect a real case (false negative) or over-flagging a valid rule (false positive)                                                                                                                                                                                                                                                           |
+| Evidence               | New tests, Slice 1                                                                                                                                                                                                                                                                                                                                                                     |
+| Status                 | Planned                                                                                                                                                                                                                                                                                                                                                                                |
+| Slice                  | 1                                                                                                                                                                                                                                                                                                                                                                                      |
+| Limits                 | Proves method-reachability only within exact `(host_pattern, path_pattern)`-equality groups (`DEC-002`) — proves nothing about shadowing across two rules with different patterns, regardless of glob-subset relationship; grounds the method universe in `HttpMethod`'s 8 closed variants, not the full open `http::Method` space; does not prove anything about Cedar-level outcomes |
 
-| Field | Content |
-| --- | --- |
-| Invariant | `INV-002` |
-| Kind | Operational |
-| Owner/proof boundary | `find_orphaned_action_classes`, consumed by `firma mapping-rules validate` |
-| Suite/boundary | Unit + CLI integration |
-| Stimulus | A registry class absent from the merged rule set, every Composio catalog, and the exemption list |
-| Observable effects | A warning line in the CLI report; exit code unaffected |
-| Controls/substitutions | Real shipped `config/mappings/*.toml` and `config/composio/*.mapping.json` files used directly in unit tests |
-| Failure cases | An exemption-list omission causing a permanent false-positive warning for a legitimately dynamic-only class; a Composio catalog update this check isn't re-run against |
-| Evidence | New tests, Slice 2 |
-| Status | Planned |
-| Slice | 2 |
-| Limits | Advisory only — does not block startup or deployment; does not verify `enrich_*` functions themselves; does not cover `firma-run`'s local execution-governance classes (`DEC-006`, explicitly excluded, not silently treated as covered) |
+| Field                  | Content                                                                                                                                                                                                                                  |
+| ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Invariant              | `INV-002`                                                                                                                                                                                                                                |
+| Kind                   | Operational                                                                                                                                                                                                                              |
+| Owner/proof boundary   | `find_orphaned_action_classes`, consumed by `firma mapping-rules validate`                                                                                                                                                               |
+| Suite/boundary         | Unit + CLI integration                                                                                                                                                                                                                   |
+| Stimulus               | A registry class absent from the merged rule set, every Composio catalog, and the exemption list                                                                                                                                         |
+| Observable effects     | A warning line in the CLI report; exit code unaffected                                                                                                                                                                                   |
+| Controls/substitutions | Real shipped `config/mappings/*.toml` and `config/composio/*.mapping.json` files used directly in unit tests                                                                                                                             |
+| Failure cases          | An exemption-list omission causing a permanent false-positive warning for a legitimately dynamic-only class; a Composio catalog update this check isn't re-run against                                                                   |
+| Evidence               | New tests, Slice 2                                                                                                                                                                                                                       |
+| Status                 | Planned                                                                                                                                                                                                                                  |
+| Slice                  | 2                                                                                                                                                                                                                                        |
+| Limits                 | Advisory only — does not block startup or deployment; does not verify `enrich_*` functions themselves; does not cover `firma-run`'s local execution-governance classes (`DEC-006`, explicitly excluded, not silently treated as covered) |

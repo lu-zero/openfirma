@@ -378,3 +378,48 @@ fn duplicate_detection_compares_normalized_hosts() {
 
     assert!(result.is_err());
 }
+
+/// A rule that shares an exact `(host, path)` tuple with other rules whose
+/// combined method coverage already claims every method it could itself
+/// match is unreachable and fails load-time validation, the same fail-closed
+/// contract `DuplicateRule` already gives operators today. See
+/// `docs/architecture/mapping-rules-prover-plan.md`, `INV-001`.
+#[test]
+fn shadowed_rule_fails_load_time_validation() {
+    let mut rules: Vec<MappingRuleConfig> = [
+        Method::GET,
+        Method::POST,
+        Method::PUT,
+        Method::DELETE,
+        Method::PATCH,
+        Method::HEAD,
+        Method::OPTIONS,
+        Method::CONNECT,
+    ]
+    .into_iter()
+    .map(|method| MappingRuleConfig {
+        method: Some(method),
+        host: "api.example.com".to_string(),
+        path: Some("/widgets".to_string()),
+        action_class: "filesystem.read".to_string(),
+    })
+    .collect();
+    rules.push(MappingRuleConfig {
+        method: None,
+        host: "api.example.com".to_string(),
+        path: Some("/widgets".to_string()),
+        action_class: "communication.external.send".to_string(),
+    });
+
+    let result = MappingTable::from_config(
+        &MappingRulesFile { rules },
+        &ActionClassRegistry::v0_1(),
+        false,
+    );
+
+    let err = result.expect_err("an any-method rule with every method already claimed by higher-priority rules must be rejected");
+    assert!(
+        err.to_string().contains("unreachable"),
+        "unexpected error message: {err}"
+    );
+}
