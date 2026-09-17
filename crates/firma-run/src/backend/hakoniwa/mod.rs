@@ -6,9 +6,9 @@
 //! — never a platform default, opt-in only. Slices 1 (network), 2 (mount
 //! translation), 3 (DNS-stub/egress-guard bootstrap), 4 (signal-forwarding
 //! parity — see `supervisor.rs`'s `hakoniwa_sandbox_root_pid`/
-//! `hakoniwa_descendant_pids`), 5 (seccomp/landlock), and `DEC-012` (Slice
-//! 7, the DNS-stub port-53 bind fix) done; still no `firma doctor` support
-//! (Slice 6).
+//! `hakoniwa_descendant_pids`), 5 (seccomp/landlock), 6 (`firma doctor`
+//! support, `crates/firma/src/doctor/sandbox.rs`'s `check_hakoniwa`), and
+//! `DEC-012` (Slice 7, the DNS-stub port-53 bind fix) done.
 
 use std::collections::BTreeMap;
 use std::env;
@@ -73,6 +73,35 @@ impl SandboxBackend for HakoniwaBackend {
 
         let runtime_dir = create_hakoniwa_runtime_dir(&request.identity.sandbox_id)?;
 
+        // NOTE: identity-mode (fake /etc/passwd, /etc/group — see
+        // `HakoniwaLaunchContract`'s own doc comment) and resolv.conf
+        // stub-pointing (mirroring `BwrapBackend::prepare`) were prototyped
+        // here and reverted. `firma-hakoniwa-runner`'s `container.rootfs("/")`
+        // reuses the host's real `/bin`/`/etc`/`/usr`/etc. directories as
+        // read-only bind mounts wholesale (`hakoniwa::Container::rootfs`'s own
+        // `rootfs_imp`), so `/etc/passwd`, `/etc/group`, and `/etc/resolv.conf`
+        // inside the sandbox are the real, root-owned host files — confirmed
+        // live: attempting to overlay our own content at those exact paths
+        // fails with `touch("etc/group") => Permission denied`, because
+        // hakoniwa's own mount-target-creation step (`sys::touch`/`sys::fwrite`
+        // in the `hakoniwa` crate) opens the *real* target file for
+        // write/append rather than creating a fresh placeholder in
+        // hakoniwa's own staging area the way `bwrap`'s selectively-built
+        // rootfs does. This is a genuine architectural gap, not a simple
+        // porting task: closing it needs `/etc` reconstructed as a fresh,
+        // writable layer (e.g. a tmpfs mounted at `/etc` ahead of these
+        // three files in hakoniwa's own target-path mount ordering) without
+        // silently dropping real host `/etc` content (locale data,
+        // `ca-certificates`, `nsswitch.conf`) many programs need — a design
+        // decision, not ported here. Two real, previously-undiscovered
+        // findings survive from this investigation regardless of the fix:
+        // (1) `/etc/resolv.conf`'s real contents (nameserver IPs, search
+        // domain) are currently readable from inside a Hakoniwa sandbox,
+        // though network-namespace isolation blocks any real query those
+        // nameservers would need; (2) ordinary resolver-based DNS lookups
+        // (`getaddrinfo`) never reach the sandbox's own DNS-refusal stub at
+        // all today — only a query hard-coded to `127.0.0.1:53` does, unlike
+        // `BwrapBackend`, which always gets a deterministic stub `REFUSED`.
         let mounts = request
             .profile
             .mounts

@@ -66,7 +66,7 @@ impl SandboxBackend for BwrapBackend {
             .collect::<Vec<_>>();
 
         if request.profile.identity_mode == SandboxIdentityMode::SandboxUser {
-            let (uid, gid) = host_uid_gid()?;
+            let (uid, gid) = platform::host_uid_gid();
             let passwd_path = runtime_dir.join("passwd");
             let group_path = runtime_dir.join("group");
             let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
@@ -123,7 +123,7 @@ impl SandboxBackend for BwrapBackend {
             // when the symlink target path differs from /etc/resolv.conf. If
             // resolution fails (broken/absent symlink) we fall back to the
             // literal path and let bwrap report any remaining mount error.
-            let resolv_conf_target = resolve_resolv_conf_target();
+            let resolv_conf_target = platform::resolve_resolv_conf_target();
 
             if resolv_conf_target != std::path::Path::new("/etc/resolv.conf") {
                 // Mount at the canonical target so reads through the symlink
@@ -298,29 +298,6 @@ impl SandboxBackend for BwrapBackend {
     }
 }
 
-/// Resolve `/etc/resolv.conf` to its canonical on-disk path, following all
-/// symlinks.
-///
-/// On hosts where `/etc/resolv.conf` is a managed symlink (e.g. WSL,
-/// systemd-resolved), `mount(2)` with `MS_BIND` follows the symlink to the
-/// final target. Pre-resolving here lets us provide the explicit target path to
-/// bwrap, preventing bind-mount failures when the symlink points into a managed
-/// location that bwrap cannot otherwise resolve.
-///
-/// Falls back to `/etc/resolv.conf` itself when:
-/// - the path is not a symlink (nothing to resolve)
-/// - `canonicalize` fails (broken symlink, permission error)
-fn resolve_resolv_conf_target() -> PathBuf {
-    resolve_resolv_conf_target_from(std::path::Path::new("/etc/resolv.conf"))
-}
-
-fn resolve_resolv_conf_target_from(resolv_conf: &std::path::Path) -> PathBuf {
-    if !resolv_conf.is_symlink() {
-        return resolv_conf.to_path_buf();
-    }
-    std::fs::canonicalize(resolv_conf).unwrap_or_else(|_| resolv_conf.to_path_buf())
-}
-
 fn preflight_host_support(
     wsl_kind: platform::WslKind,
     userns_sysctl: Option<String>,
@@ -417,49 +394,6 @@ fn create_bwrap_runtime_dir(sandbox_id: &SandboxId) -> Result<PathBuf, RunError>
     Ok(runtime_dir)
 }
 
-fn host_uid_gid() -> Result<(u32, u32), RunError> {
-    let uid = command_stdout_trimmed("id", &["-u"])?;
-    let gid = command_stdout_trimmed("id", &["-g"])?;
-    let uid = uid.parse::<u32>().map_err(|error| RunError::Backend {
-        backend: BackendKind::Bwrap.to_string(),
-        reason: format!("failed to parse host uid '{uid}': {error}"),
-    })?;
-    let gid = gid.parse::<u32>().map_err(|error| RunError::Backend {
-        backend: BackendKind::Bwrap.to_string(),
-        reason: format!("failed to parse host gid '{gid}': {error}"),
-    })?;
-    Ok((uid, gid))
-}
-
-fn command_stdout_trimmed(binary: &str, args: &[&str]) -> Result<String, RunError> {
-    let output = Command::new(binary)
-        .args(args)
-        .output()
-        .map_err(|error| RunError::Backend {
-            backend: BackendKind::Bwrap.to_string(),
-            reason: format!("failed to execute {binary} {}: {error}", args.join(" ")),
-        })?;
-    if !output.status.success() {
-        return Err(RunError::Backend {
-            backend: BackendKind::Bwrap.to_string(),
-            reason: format!(
-                "command failed: {binary} {} (status {})",
-                args.join(" "),
-                output.status
-            ),
-        });
-    }
-    String::from_utf8(output.stdout)
-        .map(|s| s.trim().to_string())
-        .map_err(|error| RunError::Backend {
-            backend: BackendKind::Bwrap.to_string(),
-            reason: format!(
-                "command output for {binary} {} is not utf-8: {error}",
-                args.join(" ")
-            ),
-        })
-}
-
 fn remove_runtime_dir(runtime_dir: &std::path::Path) {
     if runtime_dir.exists() {
         let _ = std::fs::remove_dir_all(runtime_dir);
@@ -514,33 +448,6 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&runtime_dir).expect("cleanup runtime dir");
-    }
-
-    // ── resolv.conf target resolution ────────────────────────────────────────
-
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn resolv_conf_target_is_itself_when_not_a_symlink() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let resolv_conf = dir.path().join("resolv.conf");
-        std::fs::write(&resolv_conf, "nameserver 1.1.1.1\n").expect("write resolv.conf");
-
-        let resolved = super::resolve_resolv_conf_target_from(&resolv_conf);
-        assert_eq!(resolved, resolv_conf);
-    }
-
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn resolv_conf_target_follows_symlink() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let real_file = dir.path().join("real_resolv.conf");
-        std::fs::write(&real_file, "nameserver 1.1.1.1\n").expect("write real file");
-
-        let symlink_path = dir.path().join("resolv.conf");
-        std::os::unix::fs::symlink(&real_file, &symlink_path).expect("create symlink");
-
-        let resolved = super::resolve_resolv_conf_target_from(&symlink_path);
-        assert_eq!(resolved, real_file.canonicalize().expect("canon real"));
     }
 
     #[test]

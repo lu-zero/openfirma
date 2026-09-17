@@ -14,6 +14,42 @@ use crate::audit::{AuditEvent, correlated_event};
 use crate::live_http_fixture::{LiveHttpClient, LiveHttpResponse};
 use crate::poll::wait_for;
 
+/// A Linux structural `SandboxBackend`, for scenarios parametrized across more than one.
+///
+/// `Bwrap` is always available in this test environment (the default backend); `Hakoniwa` is
+/// opt-in and needs `firma-hakoniwa-runner` built alongside `firma` — see
+/// [`hakoniwa_runner_path`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Backend {
+    Bwrap,
+    Hakoniwa,
+}
+
+impl Backend {
+    /// The `backend = "..."` value this variant selects in `firma.toml`.
+    pub(crate) fn config_value(self) -> &'static str {
+        match self {
+            Self::Bwrap => "bwrap",
+            Self::Hakoniwa => "hakoniwa",
+        }
+    }
+}
+
+/// Locates the `firma-hakoniwa-runner` binary built alongside `firma` in this workspace's target
+/// directory.
+///
+/// `env!("CARGO_BIN_EXE_<name>")` only covers binaries in the *same* Cargo package as this test
+/// target (`firma`); `firma-hakoniwa-runner` is a separate workspace member, so its path is
+/// derived from `firma`'s own sibling directory instead — the same directory Cargo places every
+/// workspace binary into. Returns `None` (rather than panicking) when it hasn't been built, so a
+/// narrowly-scoped test invocation that never builds this crate skips cleanly instead of failing
+/// for an unrelated reason.
+pub(crate) fn hakoniwa_runner_path() -> Option<PathBuf> {
+    let firma = PathBuf::from(env!("CARGO_BIN_EXE_firma"));
+    let runner = firma.with_file_name("firma-hakoniwa-runner");
+    runner.is_file().then_some(runner)
+}
+
 /// An isolated filesystem and environment for one E2E test phase.
 ///
 /// Dropping the world removes its temporary root. Commands created through the world inherit only
@@ -208,6 +244,30 @@ impl TestWorld {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
+        self.run_firma_with_env(profile, config_path, cwd, run_args, &[], program, args)
+    }
+
+    /// Same as [`Self::run_firma`], with additional environment variables set on the `firma`
+    /// process itself (not the wrapped command) — for example `FIRMA_RUN_HAKONIWA_RUNNER`, which
+    /// has no CLI flag and must reach `firma run` as a plain env var.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors firma run's own CLI surface (profile, config, cwd, run args, env, program, args) plus self"
+    )]
+    pub(crate) fn run_firma_with_env<I, S>(
+        &self,
+        profile: &str,
+        config_path: Option<&Path>,
+        cwd: &Path,
+        run_args: &[&str],
+        extra_env: &[(&str, &str)],
+        program: impl AsRef<OsStr>,
+        args: I,
+    ) -> ProcessOutput
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
         let mut command = self.isolated_command_in(env!("CARGO_BIN_EXE_firma"), cwd);
         command.args(["run", "--profile", profile]);
         if let Some(config_path) = config_path {
@@ -219,6 +279,9 @@ impl TestWorld {
             .arg(program)
             .args(args)
             .env("FIRMA_RUN_SESSION_ID", &self.session_id);
+        for (key, value) in extra_env {
+            command.env(key, value);
+        }
         run_bounded(&mut command, Duration::from_mins(2))
     }
 

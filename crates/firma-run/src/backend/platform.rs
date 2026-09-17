@@ -81,6 +81,44 @@ fn classify_osrelease(osrelease: &str) -> WslKind {
 /// [`nested_userns_restricted`]'s own "actually try it and see" approach,
 /// adapted for the top-level (non-nested) case and for a probe tool neither
 /// backend actually depends on.
+/// The current process's real uid/gid.
+///
+/// Shared by `BwrapBackend` and `HakoniwaBackend`'s `SandboxIdentityMode::SandboxUser` handling
+/// (the fake `/etc/passwd`/`/etc/group` entries and `USER`/`LOGNAME` env vars presenting a
+/// cosmetic "firma-user" identity inside the sandbox — the sandbox does not actually remap the
+/// underlying uid). A plain `getuid(2)`/`getgid(2)` read, not a shell-out to `id`: infallible, no
+/// subprocess, no dependency on `id` being on `$PATH`.
+#[must_use]
+pub fn host_uid_gid() -> (u32, u32) {
+    (
+        nix::unistd::Uid::current().as_raw(),
+        nix::unistd::Gid::current().as_raw(),
+    )
+}
+
+/// Resolve `/etc/resolv.conf` to its canonical on-disk path, following all symlinks.
+///
+/// On hosts where `/etc/resolv.conf` is a managed symlink (e.g. WSL, systemd-resolved),
+/// `mount(2)` with `MS_BIND` follows the symlink to the final target. Both `BwrapBackend` and
+/// `HakoniwaBackend` pre-resolve the chain here so they can mount their own stub-pointing content
+/// at the explicit canonical target too, preventing bind-mount failures when the symlink points
+/// into a managed location the sandbox rootfs cannot otherwise resolve.
+///
+/// Falls back to `/etc/resolv.conf` itself when:
+/// - the path is not a symlink (nothing to resolve)
+/// - `canonicalize` fails (broken symlink, permission error)
+#[must_use]
+pub fn resolve_resolv_conf_target() -> std::path::PathBuf {
+    resolve_resolv_conf_target_from(std::path::Path::new("/etc/resolv.conf"))
+}
+
+fn resolve_resolv_conf_target_from(resolv_conf: &std::path::Path) -> std::path::PathBuf {
+    if !resolv_conf.is_symlink() {
+        return resolv_conf.to_path_buf();
+    }
+    std::fs::canonicalize(resolv_conf).unwrap_or_else(|_| resolv_conf.to_path_buf())
+}
+
 #[must_use]
 pub fn userns_restricted() -> Option<String> {
     combine_userns_restriction(
@@ -193,6 +231,31 @@ fn check_sysctl_blocked(
 mod tests {
     use super::*;
     use std::io::Write as _;
+
+    // ── resolv.conf target resolution ────────────────────────────────────────
+
+    #[test]
+    fn resolv_conf_target_is_itself_when_not_a_symlink() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let resolv_conf = dir.path().join("resolv.conf");
+        std::fs::write(&resolv_conf, "nameserver 1.1.1.1\n").expect("write resolv.conf");
+
+        let resolved = resolve_resolv_conf_target_from(&resolv_conf);
+        assert_eq!(resolved, resolv_conf);
+    }
+
+    #[test]
+    fn resolv_conf_target_follows_symlink() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real_file = dir.path().join("real_resolv.conf");
+        std::fs::write(&real_file, "nameserver 1.1.1.1\n").expect("write real file");
+
+        let symlink_path = dir.path().join("resolv.conf");
+        std::os::unix::fs::symlink(&real_file, &symlink_path).expect("create symlink");
+
+        let resolved = resolve_resolv_conf_target_from(&symlink_path);
+        assert_eq!(resolved, real_file.canonicalize().expect("canon real"));
+    }
 
     // ── WSL detection ────────────────────────────────────────────────────────
 

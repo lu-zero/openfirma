@@ -1,22 +1,25 @@
-//! `backend = "hakoniwa"` — Slices 1, 2, and 5 of `docs/architecture/hakoniwa-backend-plan.md`.
+//! `backend = "hakoniwa"` — Slices 1, 2, 3, 4, 5, and 7 of
+//! `docs/architecture/hakoniwa-backend-plan.md`; Slice 6 (`firma doctor` support) is Rust-API-only
+//! and has no e2e counterpart in this file.
 //!
 //! `hakoniwa_backend_blocks_network_like_bwrap` proves `PROOF-001`'s bare-network-namespace case:
 //! a root command launched under the experimental Hakoniwa backend cannot reach a service outside
-//! its own sandbox, while the same command reaches it fine when run unsandboxed. There is no
-//! DNS-stub/egress-guard bootstrap yet (Slice 3), so this only proves namespace-level confinement
-//! — not the descendant-inheritance property `child_process_governance`'s tests prove for `bwrap`.
-//! `hakoniwa_backend_denies_filesystem_delete_via_seccomp` and
-//! `hakoniwa_backend_restricts_descendant_exec_via_landlock` prove Slice 5's seccomp/Landlock
+//! its own sandbox, while the same command reaches it fine when run unsandboxed.
+//! `hakoniwa_backend_dns_stub_answers_real_queries` proves Slice 3/`DEC-012`'s DNS-stub/egress-
+//! guard bootstrap is live, not still pending. `hakoniwa_backend_denies_filesystem_delete_via_seccomp`
+//! and `hakoniwa_backend_restricts_descendant_exec_via_landlock` prove Slice 5's seccomp/Landlock
 //! wiring. Since Slice 2, the run's working directory is the isolated test workspace itself (mount
 //! translation makes it visible inside the sandbox); earlier slices ran from `/tmp` as a
-//! bare-rootfs workaround.
+//! bare-rootfs workaround. TOCTOU-relevant config-masking coverage for this backend's own,
+//! independently-duplicated masking logic lives in `config_masking.rs`, parametrized across both
+//! backends rather than mirrored here.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::harness::{TestWorld, run_bounded};
+use crate::harness::{TestWorld, hakoniwa_runner_path, run_bounded};
 use crate::upstream::{HttpProbe, ProbeBehavior};
 
 /// Shell logic shared by the control (unsandboxed) and blocked (sandboxed) runs: attempt one GET
@@ -50,21 +53,6 @@ const DESCENDANT_EXEC_SCRIPT: &str = "/bin/true; echo TRUE_EXIT=$?";
 /// before it would finish naturally.
 const WATCHDOG_SCRIPT: &str = "env | grep -c '^FIRMA_RUN_' || true; \
      i=0; while [ $i -lt 30 ]; do echo tick=$i; sleep 1; i=$((i+1)); done; echo FINISHED_ALL_TICKS";
-
-/// Locates the `firma-hakoniwa-runner` binary built alongside `firma` in this workspace's target
-/// directory.
-///
-/// `env!("CARGO_BIN_EXE_<name>")` only covers binaries in the *same* Cargo package as this test
-/// target (`firma`); `firma-hakoniwa-runner` is a separate workspace member, so its path is
-/// derived from `firma`'s own sibling directory instead — the same directory Cargo places every
-/// workspace binary into. Returns `None` (rather than panicking) when it hasn't been built, so a
-/// narrowly-scoped test invocation that never builds this crate skips cleanly instead of failing
-/// for an unrelated reason.
-fn hakoniwa_runner_path() -> Option<PathBuf> {
-    let firma = PathBuf::from(env!("CARGO_BIN_EXE_firma"));
-    let runner = firma.with_file_name("firma-hakoniwa-runner");
-    runner.is_file().then_some(runner)
-}
 
 /// Returns the first existing path from an ordered list of platform-specific candidates.
 fn first_existing(candidates: &[&str]) -> Option<PathBuf> {

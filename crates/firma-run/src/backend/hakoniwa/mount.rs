@@ -371,7 +371,10 @@ fn validate_infrastructure_mount(
     let valid_target = match kind {
         SandboxInfrastructureKind::Passwd => spec.target == Path::new("/etc/passwd"),
         SandboxInfrastructureKind::Group => spec.target == Path::new("/etc/group"),
-        SandboxInfrastructureKind::ResolverConfig => spec.target == Path::new("/etc/resolv.conf"),
+        SandboxInfrastructureKind::ResolverConfig => {
+            spec.target == Path::new("/etc/resolv.conf")
+                || spec.target == crate::backend::platform::resolve_resolv_conf_target()
+        }
     };
     if spec.read_only && valid_target {
         return Ok(());

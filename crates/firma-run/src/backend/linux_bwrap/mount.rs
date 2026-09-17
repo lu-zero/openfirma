@@ -972,7 +972,7 @@ fn validate_infrastructure_mount(
         SandboxInfrastructureKind::Group => spec.target == Path::new("/etc/group"),
         SandboxInfrastructureKind::ResolverConfig => {
             spec.target == Path::new("/etc/resolv.conf")
-                || spec.target == super::resolve_resolv_conf_target()
+                || spec.target == crate::backend::platform::resolve_resolv_conf_target()
         }
     };
     if spec.read_only && valid_target {

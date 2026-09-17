@@ -304,6 +304,17 @@ Artifacts:
 - FIR-61: implement backend interface + default profiles.
 - FIR-62: Claude Code / `run_shell` specialization on FIR-61 foundation.
 
+## Addendum (2026-09-14): `hakoniwa`, a fifth backend
+
+`docs/architecture/hakoniwa-backend-plan.md` (`DEC-010`) added `hakoniwa` — an
+experimental, opt-in-only Linux backend (unprivileged user namespaces +
+Landlock + seccomp via the embedded `hakoniwa` crate, never auto-selected,
+never a platform default) — alongside the backend family this ADR selected.
+This is a cross-reference, not a revision: the decision and rationale above
+stand unchanged for `bwrap`/`vz`/`wsl2`/`firecracker`; `hakoniwa` is a new,
+additional option layered on top, tracked in its own plan document and in
+`docs-site/src/content/docs/concepts/sandbox.md`'s backend tables.
+
 ## Ownership and sign-off
 
 - Author: Dario
