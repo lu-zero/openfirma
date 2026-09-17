@@ -340,13 +340,21 @@ fn preflight_host_support(
     }
 
     // Some kernels (notably Debian/Ubuntu hardened builds) restrict
-    // unprivileged user namespace creation via a sysctl. Detect and report
-    // before bwrap fails without a useful message.
+    // unprivileged user namespace creation via a sysctl; others (Ubuntu
+    // 23.10+/24.04+) restrict it via an AppArmor policy `userns_restricted`
+    // can only detect with a functional probe, reported as a descriptive
+    // sentence rather than a `/proc/sys/...` path. Detect and report before
+    // bwrap fails without a useful message.
     if let Some(sysctl) = userns_sysctl {
+        let detail = if sysctl.starts_with('/') {
+            format!("{sysctl}=0")
+        } else {
+            sysctl.clone()
+        };
         return Err(RunError::UnsupportedBackend {
             backend: BackendKind::Bwrap.to_string(),
             reason: format!(
-                "user namespace creation is restricted ({sysctl}=0); {}",
+                "user namespace creation is restricted ({detail}); {}",
                 userns_remediation(&sysctl)
             ),
         });

@@ -48,24 +48,100 @@ fn classify_osrelease(osrelease: &str) -> WslKind {
     }
 }
 
-/// Check whether unprivileged user namespace creation is blocked by a kernel
-/// sysctl.
+/// Check whether unprivileged user namespace creation is blocked, by sysctl
+/// or by any other mechanism.
 ///
-/// Returns `Some(sysctl_path)` naming the restricting knob when user namespaces
-/// are disabled, `None` when they appear to be available or the check is
-/// inconclusive (file absent ⟹ restriction not applicable on this kernel).
+/// Notably catches Ubuntu 23.10+/24.04+'s `AppArmor`
+/// `kernel.apparmor_restrict_unprivileged_userns` restriction, which is
+/// enforced via an `AppArmor` profile decision on the `unshare(2)`/`clone(2)`
+/// call itself, not through either sysctl below.
 ///
-/// Two knobs are probed in order:
+/// Returns `Some(description)` — a specific sysctl path when one of the two
+/// known knobs is the cause, or a generic description when a functional
+/// probe fails without either knob being set — when user namespace creation
+/// is blocked; `None` when it appears to be available or every check is
+/// inconclusive (fails open, matching this module's own established
+/// convention: an environment this function can't positively confirm as
+/// restricted is treated as unrestricted, never the reverse).
+///
+/// Two sysctls are probed first, in order (cheap, no subprocess):
 /// - `/proc/sys/kernel/unprivileged_userns_clone` — Debian/Ubuntu explicit
 ///   disable flag; value `"0"` means disabled.
 /// - `/proc/sys/user/max_user_namespaces` — generic Linux (≥ 4.15); value
 ///   `"0"` means disabled.
+///
+/// If neither sysctl indicates a restriction, a functional probe follows:
+/// actually attempt unprivileged user namespace creation (via the `unshare`
+/// utility, a plain, single-level probe — deliberately not `bwrap`, since
+/// this function is also called from `HakoniwaBackend`'s own preflight,
+/// which has no dependency on `bwrap` being installed at all) and observe
+/// whether it succeeds. This is what catches AppArmor-restricted hosts:
+/// their sysctls read as "unrestricted" (neither knob is set), yet the
+/// kernel still denies the underlying `unshare(2)` call. Mirrors
+/// [`nested_userns_restricted`]'s own "actually try it and see" approach,
+/// adapted for the top-level (non-nested) case and for a probe tool neither
+/// backend actually depends on.
 #[must_use]
 pub fn userns_restricted() -> Option<String> {
-    check_sysctl_blocked(
-        "/proc/sys/kernel/unprivileged_userns_clone",
-        "/proc/sys/user/max_user_namespaces",
+    combine_userns_restriction(
+        check_sysctl_blocked(
+            "/proc/sys/kernel/unprivileged_userns_clone",
+            "/proc/sys/user/max_user_namespaces",
+        ),
+        userns_creation_probe(),
     )
+}
+
+/// Testable inner function combining the sysctl result with the functional
+/// probe's result. A specific sysctl match always wins (more precise
+/// diagnostic); otherwise a probe that genuinely ran and failed
+/// (`Some(false)`) is reported generically; a probe that couldn't run at
+/// all (`None`) or succeeded (`Some(true)`) means "not restricted."
+fn combine_userns_restriction(
+    sysctl_result: Option<String>,
+    probe_result: Option<bool>,
+) -> Option<String> {
+    if sysctl_result.is_some() {
+        return sysctl_result;
+    }
+    if probe_result == Some(false) {
+        // A noun phrase, deliberately not a `/proc/sys/...` path — callers
+        // that build a message like `"restricted by {sysctl}"` or
+        // `"restricted ({sysctl}=0)"` must check `starts_with('/')` before
+        // appending any sysctl-specific suffix (see both callers' own
+        // handling); this string is never a real path.
+        return Some(
+            "an AppArmor policy (commonly kernel.apparmor_restrict_unprivileged_userns on \
+             Ubuntu 23.10+/24.04+, not surfaced through either the unprivileged_userns_clone \
+             or max_user_namespaces sysctl)"
+                .to_owned(),
+        );
+    }
+    None
+}
+
+/// Actually attempt unprivileged user namespace creation and report whether
+/// it succeeded.
+///
+/// Returns `Some(true)`/`Some(false)` when the probe genuinely ran, `None`
+/// when the probe itself couldn't run at all (the `unshare` utility is
+/// missing, or this isn't Linux) — an inconclusive result, not a positive
+/// restriction finding, so callers fail open on `None` the same way the
+/// sysctl checks fail open on an absent file.
+#[cfg(target_os = "linux")]
+fn userns_creation_probe() -> Option<bool> {
+    std::process::Command::new("unshare")
+        .args(["--user", "true"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .ok()
+        .map(|status| status.success())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn userns_creation_probe() -> Option<bool> {
+    None
 }
 
 /// Returns `true` when nested user-namespace creation (bwrap inside bwrap) is blocked.
@@ -226,5 +302,53 @@ mod tests {
         );
         // First matching path is returned
         assert!(result.unwrap().contains("unprivileged_userns_clone"));
+    }
+
+    // ── Functional-probe fallback (AppArmor restriction, e.g. Ubuntu 24.04) ──
+
+    #[test]
+    fn combine_prefers_a_specific_sysctl_match_over_the_probe_result() {
+        // Even if the probe (hypothetically) disagreed, a specific sysctl
+        // match is the more precise diagnostic and must win.
+        let result = combine_userns_restriction(
+            Some("/proc/sys/user/max_user_namespaces".to_owned()),
+            Some(true),
+        );
+        assert_eq!(
+            result.as_deref(),
+            Some("/proc/sys/user/max_user_namespaces")
+        );
+    }
+
+    #[test]
+    fn combine_reports_restricted_when_probe_fails_and_no_sysctl_matched() {
+        // This is exactly the Ubuntu 23.10+/24.04+ AppArmor case: neither
+        // sysctl is set, but the functional probe still fails.
+        let result = combine_userns_restriction(None, Some(false));
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("AppArmor"));
+    }
+
+    #[test]
+    fn combine_fails_open_when_the_probe_is_inconclusive() {
+        // The `unshare` utility being absent (or non-Linux) must never be
+        // mistaken for a positive restriction finding.
+        assert!(combine_userns_restriction(None, None).is_none());
+    }
+
+    #[test]
+    fn combine_is_not_restricted_when_probe_succeeds_and_no_sysctl_matched() {
+        assert!(combine_userns_restriction(None, Some(true)).is_none());
+    }
+
+    #[test]
+    fn userns_creation_probe_runs_without_panicking_on_this_host() {
+        // A real, unmocked sanity check that the probe mechanism itself
+        // (spawning `unshare --user true`) doesn't panic or hang on a real
+        // host — the actual restriction-detection logic is covered above
+        // via `combine_userns_restriction`, which is what's actually
+        // reachable from CI/test hosts that may or may not have `unshare`
+        // installed or user namespaces available.
+        let _ = userns_creation_probe();
     }
 }

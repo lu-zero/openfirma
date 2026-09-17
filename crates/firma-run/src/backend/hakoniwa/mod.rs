@@ -4,9 +4,11 @@
 //!
 //! Experimental (see `docs/architecture/hakoniwa-backend-plan.md`, `DEC-010`)
 //! — never a platform default, opt-in only. Slices 1 (network), 2 (mount
-//! translation), 3 (DNS-stub/egress-guard bootstrap), and 5 (seccomp/landlock)
-//! done; still no signal-forwarding parity (Slice 4), no `firma doctor`
-//! support (Slice 6).
+//! translation), 3 (DNS-stub/egress-guard bootstrap), 4 (signal-forwarding
+//! parity — see `supervisor.rs`'s `hakoniwa_sandbox_root_pid`/
+//! `hakoniwa_descendant_pids`), 5 (seccomp/landlock), and `DEC-012` (Slice
+//! 7, the DNS-stub port-53 bind fix) done; still no `firma doctor` support
+//! (Slice 6).
 
 use std::collections::BTreeMap;
 use std::env;
@@ -67,15 +69,7 @@ impl SandboxBackend for HakoniwaBackend {
             });
         }
 
-        if let Some(sysctl) = platform::userns_restricted() {
-            return Err(RunError::UnsupportedBackend {
-                backend: BackendKind::Hakoniwa.to_string(),
-                reason: format!(
-                    "unprivileged user namespace creation is restricted by {sysctl}; \
-                     enable it or use a different backend"
-                ),
-            });
-        }
+        preflight_host_support(platform::detect_wsl(), platform::userns_restricted())?;
 
         let runtime_dir = create_hakoniwa_runtime_dir(&request.identity.sandbox_id)?;
 
@@ -103,8 +97,9 @@ impl SandboxBackend for HakoniwaBackend {
     ) -> Result<EnforcementProof, RunError> {
         let structural = policy.enforce_network_namespace;
         let detail = if structural {
-            "network namespace isolation enabled; sandbox-local loopback only (Slice 1 — no \
-             DNS-stub/egress-guard bootstrap yet)"
+            "network namespace isolation enabled; sandbox-local loopback only, with DNS refused \
+             and HTTP/HTTPS relayed through the DNS-stub/proxy-bridge chain to the Sidecar \
+             (Slice 3, DEC-012)"
                 .to_string()
         } else {
             "network namespace isolation disabled; cooperative routing mode".to_string()
@@ -270,6 +265,77 @@ impl SandboxBackend for HakoniwaBackend {
         reject_foreign_handle(&handle)?;
         let _ = std::fs::remove_dir_all(&handle.runtime_dir);
         Ok(())
+    }
+}
+
+/// Fails closed on host environments this backend cannot actually run on,
+/// before any runtime-directory or mount work begins. Mirrors
+/// `linux_bwrap::preflight_host_support` exactly (same two checks, same
+/// reasoning) — found missing here while wiring `firma doctor` support
+/// (Slice 6): `HakoniwaBackend::prepare`'s own `cfg!(target_os = "linux")`
+/// check is true under WSL (it runs a real Linux kernel), so nothing else
+/// in `prepare` caught it. Hakoniwa needs the exact same kernel primitive
+/// bwrap does (unprivileged user namespaces), which WSL does not support.
+/// A pure function of its two inputs (not reading `/proc` itself) so it's
+/// directly testable without a real WSL/restricted host.
+fn preflight_host_support(
+    wsl_kind: platform::WslKind,
+    userns_restriction: Option<String>,
+) -> Result<(), RunError> {
+    if wsl_kind.is_wsl() {
+        return Err(RunError::UnsupportedBackend {
+            backend: BackendKind::Hakoniwa.to_string(),
+            reason: "WSL environment detected; hakoniwa requires unprivileged user \
+                     namespaces which are unavailable under WSL. Use a non-hakoniwa \
+                     backend on this host or run `firma doctor` for a full sandbox \
+                     compatibility report."
+                .to_string(),
+        });
+    }
+    if let Some(restriction) = userns_restriction {
+        return Err(RunError::UnsupportedBackend {
+            backend: BackendKind::Hakoniwa.to_string(),
+            reason: format!(
+                "unprivileged user namespace creation is restricted by {restriction}; \
+                 enable it or use a different backend"
+            ),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod preflight_tests {
+    use super::{RunError, preflight_host_support};
+    use crate::backend::platform::WslKind;
+
+    #[test]
+    fn preflight_rejects_wsl() {
+        let result = preflight_host_support(WslKind::Wsl2, None);
+        let err = result.expect_err("WSL must be rejected for hakoniwa");
+        let RunError::UnsupportedBackend { reason, .. } = err else {
+            panic!("expected UnsupportedBackend, got {err:?}");
+        };
+        assert!(reason.to_ascii_lowercase().contains("wsl"));
+    }
+
+    #[test]
+    fn preflight_rejects_userns_restriction() {
+        let result = preflight_host_support(
+            WslKind::NotWsl,
+            Some("/proc/sys/user/max_user_namespaces".to_owned()),
+        );
+        let err = result.expect_err("a restricted host must be rejected for hakoniwa");
+        let RunError::UnsupportedBackend { reason, .. } = err else {
+            panic!("expected UnsupportedBackend, got {err:?}");
+        };
+        assert!(reason.contains("max_user_namespaces"));
+    }
+
+    #[test]
+    fn preflight_allows_an_ordinary_native_linux_host() {
+        preflight_host_support(WslKind::NotWsl, None)
+            .expect("a native Linux host with no restriction must be allowed");
     }
 }
 

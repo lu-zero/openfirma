@@ -121,8 +121,11 @@ pub struct HostProbe {
     pub os: OsFamily,
     /// Whether the process is running inside any WSL environment.
     pub wsl: bool,
-    /// `Some(sysctl_path)` when unprivileged user-namespace creation is blocked
-    /// (so bubblewrap cannot construct a sandbox), `None` otherwise.
+    /// `Some(detail)` when unprivileged user-namespace creation is blocked
+    /// (so bubblewrap cannot construct a sandbox), `None` otherwise. `detail`
+    /// is a `/proc/sys/...` path when a sysctl is the cause, or a descriptive
+    /// sentence (e.g. naming an `AppArmor` policy) when only a functional probe
+    /// detected the restriction — never assume it's always a path.
     pub userns_restricted: Option<String>,
 }
 
@@ -204,10 +207,15 @@ async fn check_bwrap(label: &'static str, host: &HostProbe, prober: &dyn Prober)
         );
     }
     if let Some(sysctl) = &host.userns_restricted {
+        let detail = if sysctl.starts_with('/') {
+            format!("{sysctl}=0")
+        } else {
+            sysctl.clone()
+        };
         return Check::fail(
             label,
             format!(
-                "user namespace creation restricted ({sysctl}=0); \
+                "user namespace creation restricted ({detail}); \
                  bubblewrap cannot construct a sandbox until this is enabled"
             ),
         );
