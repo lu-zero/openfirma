@@ -32,7 +32,9 @@ pub struct RunArgs {
     pub capability_file: Option<PathBuf>,
 
     /// Override how the agent's identity is mapped inside the sandbox
-    /// (`sandbox-user` for an isolated uid, `host-user` to keep the caller's uid).
+    /// (`sandbox-user` for a non-host identity, `host-user` to keep the
+    /// caller's uid). Whether `sandbox-user` is a real uid remap or a
+    /// cosmetic identity depends on the selected backend.
     #[arg(long, value_enum)]
     pub identity_mode: Option<IdentityModeOverride>,
 

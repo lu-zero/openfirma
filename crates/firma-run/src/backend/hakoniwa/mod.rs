@@ -23,7 +23,7 @@ use crate::backend::{
     BackendKind, EnforcementProof, LaunchSpec, NetworkConfinement, PrepareRequest, SandboxBackend,
     SandboxHandle, SandboxMount,
 };
-use crate::config::{ExecutionGovernanceStrategy, NetworkPolicy};
+use crate::config::{ExecutionGovernanceStrategy, NetworkPolicy, SandboxIdentityMode};
 use crate::error::RunError;
 
 mod mount;
@@ -38,7 +38,7 @@ const HAKONIWA_RUNNER_ENV: &str = "FIRMA_RUN_HAKONIWA_RUNNER";
 
 /// Version of the on-disk launch-contract schema `firma-hakoniwa-runner`
 /// understands. Must match `firma-hakoniwa-runner`'s own constant.
-const LAUNCH_CONTRACT_VERSION: u32 = 5;
+const LAUNCH_CONTRACT_VERSION: u32 = 6;
 
 /// Fixed in-sandbox path `firma` is bind-mounted at for the DNS-stub/
 /// proxy-bridge/egress-guarded-run orchestration (`DEC-003`) to exec — see
@@ -221,6 +221,20 @@ impl SandboxBackend for HakoniwaBackend {
             "FIRMA_RUN_RUNTIME_DIR".to_string(),
             handle.runtime_dir.display().to_string(),
         );
+        // Mirrors `BwrapBackend::start_agent`'s own `--setenv USER`/`--setenv
+        // LOGNAME`. The real identity isolation (a genuine, kernel-level uid
+        // remap, not a file overlay) is done runner-side via
+        // `contract.identity_mode` — see `firma-hakoniwa-runner`'s own
+        // `run()` and `Container::uidmap`/`gidmap`. These two env vars are
+        // the purely cosmetic half: tools that check `$USER`/`$LOGNAME`
+        // directly (rather than `getpwuid`) see "firma-user" here, same as
+        // `bwrap`, even though `getpwuid` itself will resolve the remapped
+        // uid to "nobody" (a real, universal system account), not
+        // "firma-user" — a deliberate, harmless inconsistency, not a bug.
+        if launch.identity_mode == SandboxIdentityMode::SandboxUser {
+            env.insert("USER".to_string(), "firma-user".to_string());
+            env.insert("LOGNAME".to_string(), "firma-user".to_string());
+        }
         if let Some(self_exe) = env.get("FIRMA_RUN_SELF_EXE").cloned() {
             mounts.push(HakoniwaMountOp::Bind {
                 source: PathBuf::from(self_exe),
@@ -270,6 +284,7 @@ impl SandboxBackend for HakoniwaBackend {
             executable: launch.executable.clone(),
             args: launch.args.clone(),
             cwd: launch.cwd.clone(),
+            identity_mode: launch.identity_mode,
             env,
             mounts,
             deny_syscalls: launch.deny_syscalls.clone().unwrap_or_default(),
@@ -430,16 +445,22 @@ fn create_hakoniwa_runtime_dir(sandbox_id: &SandboxId) -> Result<PathBuf, RunErr
 /// Launch payload handed to `firma-hakoniwa-runner`.
 ///
 /// Must stay in sync with `firma-hakoniwa-runner`'s own `LaunchContract`.
-/// Still no identity-mode support (`BwrapBackend`'s sandbox-user remap,
-/// passwd/group mounts) — unlike signal-forwarding (Slice 4) and mount-plan
-/// translation (Slice 2), both now implemented without adding it, this is a
-/// genuinely open, not-yet-scoped-into-any-slice gap, not upcoming work.
+///
+/// Identity-mode support is real but partial: `identity_mode` drives a
+/// genuine, kernel-level uid/gid remap (`Container::uidmap`/`gidmap` in the
+/// runner, not a `bwrap`-style `/etc/passwd`/`/etc/group` file overlay —
+/// that approach was tried and reverted, since `hakoniwa::Container::rootfs`
+/// reuses the host's real `/etc` wholesale, so overlaying a single file
+/// there fails with `touch("etc/group") => Permission denied`; see the
+/// plan doc's Slice 2 notes for the full finding). `USER`/`LOGNAME` env vars
+/// (below, in `start_agent`) are the purely cosmetic half.
 #[derive(Debug, Serialize)]
 struct HakoniwaLaunchContract {
     version: u32,
     executable: String,
     args: Vec<String>,
     cwd: PathBuf,
+    identity_mode: SandboxIdentityMode,
     env: BTreeMap<String, String>,
     /// Fully resolved, validated filesystem operations for the sandbox,
     /// computed by [`mount::build_mount_ops`]. The runner replays these

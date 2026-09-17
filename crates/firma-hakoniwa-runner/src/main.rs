@@ -25,7 +25,21 @@ use nix::fcntl::{FcntlArg, FdFlag, fcntl};
 use serde::{Deserialize, Serialize};
 
 /// Version of the on-disk launch-contract schema this binary understands.
-const LAUNCH_CONTRACT_VERSION: u32 = 5;
+const LAUNCH_CONTRACT_VERSION: u32 = 6;
+
+/// In-namespace uid/gid `IdentityMode::SandboxUser` remaps to via
+/// `Container::uidmap`/`gidmap` — the standard "nobody"/"nogroup" ids nearly
+/// every Linux host's real `/etc/passwd`/`/etc/group` already define. A
+/// genuine kernel-level remap (the process's own `getuid()` reports this,
+/// not the real host uid), not a file overlay: `Container::rootfs("/")`
+/// reuses the host's real `/etc` wholesale, so replacing `/etc/passwd`
+/// itself fails (`touch("etc/group") => Permission denied` — see the plan
+/// doc's Slice 2 notes). Mapping to the *real* nobody/nogroup ids instead
+/// means `getpwuid`/`getgrgid`-based lookups (`whoami`, etc.) resolve to a
+/// real, generic, non-identifying account rather than erroring out or
+/// leaking the real host username.
+const SANDBOX_IDENTITY_UID: u32 = 65534;
+const SANDBOX_IDENTITY_GID: u32 = 65534;
 
 /// `flags` value that makes `landlock_create_ruleset(2)` behave as a pure
 /// ABI-version probe: with a null `attr` and zero `size`, the kernel returns
@@ -87,15 +101,28 @@ struct Cli {
     launch_contract: PathBuf,
 }
 
+/// Mirrors `firma_run::config::SandboxIdentityMode`'s wire shape (JSON,
+/// `snake_case`) — duplicated, not shared, since this binary depends only on
+/// the launch-contract JSON schema, not on the `firma-run` crate itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum IdentityMode {
+    SandboxUser,
+    HostUser,
+}
+
 /// Launch payload written by `HakoniwaBackend::start_agent`.
 ///
-/// Still no identity-mode support — that lands in Slice 4/2.
+/// `identity_mode` drives a real `Container::uidmap`/`gidmap` remap in
+/// `run()` — see [`SANDBOX_IDENTITY_UID`]'s own doc comment for why this is
+/// a kernel-level remap, not a `bwrap`-style `/etc/passwd` file overlay.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LaunchContract {
     version: u32,
     executable: String,
     args: Vec<String>,
     cwd: PathBuf,
+    identity_mode: IdentityMode,
     env: BTreeMap<String, String>,
     /// Fully resolved, validated filesystem operations computed by
     /// `firma-run`'s `hakoniwa::mount::build_mount_ops`. This binary makes no
@@ -162,6 +189,17 @@ fn run(contract_path: &Path) -> Result<i32, RunnerError> {
 
     let mut container = Container::new();
     container.unshare(Namespace::Network);
+    // `Container::new()` already unshares `Namespace::User` with an identity
+    // uid/gid mapping (real uid -> same in-namespace uid) — overriding it
+    // here with a distinct value is what actually remaps the reported
+    // identity; the mapping stays a single entry, so file-ownership checks
+    // against the sandboxed process's own files are unaffected (they are
+    // still owned by the same real host uid, now just displayed under the
+    // new number). See `SANDBOX_IDENTITY_UID`'s own doc comment.
+    if contract.identity_mode == IdentityMode::SandboxUser {
+        container.uidmap(SANDBOX_IDENTITY_UID);
+        container.gidmap(SANDBOX_IDENTITY_GID);
+    }
     // Some bind-mount sources (e.g. `/dev/null`, used to mask config files —
     // see `HakoniwaMountOp`) come from filesystems the host already mounted
     // with locked flags (nosuid/noexec/nodev). Making such a bind read-only
