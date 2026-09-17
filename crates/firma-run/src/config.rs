@@ -642,13 +642,6 @@ pub(crate) fn resolve_profile_with_layout(
         .unwrap_or(SandboxIdentityMode::SandboxUser);
 
     let execution_governance = patch.execution_governance.unwrap_or_default();
-    if execution_governance != ExecutionGovernanceStrategy::Inherited {
-        validate_execution_governance_preconditions(
-            execution_governance,
-            backend,
-            sidecar_local_exec.as_ref(),
-        )?;
-    }
 
     let executable_policies = patch
         .executable_policies
@@ -672,6 +665,16 @@ pub(crate) fn resolve_profile_with_layout(
             &profile_id,
             backend,
         )?);
+
+    if execution_governance != ExecutionGovernanceStrategy::Inherited {
+        validate_execution_governance_preconditions(
+            execution_governance,
+            backend,
+            sidecar_local_exec.as_ref(),
+            seccomp_policy.as_ref(),
+        )?;
+    }
+
     let resolved = ResolvedProfile {
         id: profile_id,
         backend,
@@ -744,23 +747,42 @@ fn default_backend_for_host() -> BackendKind {
 /// "fall back to the platform default" resolution (`resolve_backend`), where
 /// every fallback still provides some real backend.
 ///
-/// `PtraceSeccompExec` currently assumes the sandboxed process tree runs
-/// under `bwrap`'s own PID namespace (`sandbox_child_pid`'s attach target)
-/// — see `docs/architecture/ptrace-seccomp-exec-gate-plan.md`'s own
-/// Assumptions — so it is scoped to `BackendKind::Bwrap` only, not every
-/// Linux-capable backend. It also assumes `sidecar_local_exec` is
-/// configured with a non-empty, enforced `allowed_executables` set to
-/// actually check descendant execs against; without that there is nothing
-/// for this strategy to enforce.
+/// `PtraceSeccompExec` needs the sandboxed process tree to be real, host OS
+/// processes it can `ptrace(2)`-attach to and whose spawning backend exposes
+/// a `SandboxHandle::runtime_dir` reachable from inside the sandbox — both
+/// `BwrapBackend` and `HakoniwaBackend` satisfy this (Hakoniwa's own runner
+/// forks once and that fork's pid is already the one that becomes the
+/// wrapped command, so it needs none of `sandbox_child_pid`'s discovery
+/// dance bwrap's own attach uses — see
+/// `docs/architecture/ptrace-seccomp-exec-gate-plan.md`); a VM-based backend
+/// does not, since the wrapped command never runs as a process this host can
+/// `ptrace(2)` at all. It also assumes
+/// `sidecar_local_exec` is configured with a non-empty, enforced
+/// `allowed_executables` set to actually check descendant execs against;
+/// without that there is nothing for this strategy to enforce.
+///
+/// A profile's own seccomp policy denying `execve`/`execveat` outright
+/// (Cedar's `system.execute` deny action, `SyscallId::Execve`/`Execveat` in
+/// `crate::seccomp`) is rejected too: seccomp filters stack, and the kernel
+/// applies the *most restrictive* action across every attached filter for a
+/// given syscall (`ERRNO`/`KILL` outrank `TRACE`) — so a profile denying
+/// `system.execute` would make every exec fail before this strategy's own
+/// filter (`SECCOMP_RET_TRACE`) is ever consulted, silently turning its
+/// fine-grained `allowed_executables` check into dead code. This applies
+/// equally to both backends: `BwrapBackend` compiles the same policy source
+/// into its static BPF artifact (`resolve_effective_seccomp`) that
+/// `HakoniwaBackend` reads as syscall names directly
+/// (`resolve_deny_syscall_names`) — one shared source, so one shared guard.
 fn validate_execution_governance_preconditions(
     strategy: ExecutionGovernanceStrategy,
     backend: BackendKind,
     sidecar_local_exec: Option<&CommandMediatorConfig>,
+    seccomp_policy: Option<&SeccompPolicyConfig>,
 ) -> Result<(), RunError> {
-    if backend != BackendKind::Bwrap {
+    if !matches!(backend, BackendKind::Bwrap | BackendKind::Hakoniwa) {
         return Err(RunError::ConfigValidation(format!(
             "execution_governance = '{strategy:?}' is unsupported for backend '{backend}'; only \
-             'bwrap' is supported"
+             'bwrap' and 'hakoniwa' are supported"
         )));
     }
     let enforced = sidecar_local_exec.is_some_and(|mediator| {
@@ -771,6 +793,17 @@ fn validate_execution_governance_preconditions(
             "execution_governance = '{strategy:?}' requires sidecar_local_exec with \
              enforce_known_executables = true and a non-empty allowed_executables set — there is \
              nothing to check descendant execs against otherwise"
+        )));
+    }
+    if let Some(names) = crate::seccomp::resolve_deny_syscall_names(seccomp_policy)?
+        && names.iter().any(|name| *name == "execve" || *name == "execveat")
+    {
+        return Err(RunError::ConfigValidation(format!(
+            "execution_governance = '{strategy:?}' is pointless combined with a seccomp policy \
+             that already denies 'system.execute': every exec would already fail closed before \
+             this strategy's own allowed_executables check is ever consulted — remove \
+             'system.execute' from deny_actions, or drop execution_governance and rely on the \
+             seccomp policy alone"
         )));
     }
     Ok(())
@@ -1772,7 +1805,7 @@ secret_providers = ["op"]
     }
 
     #[test]
-    fn execution_governance_ptrace_seccomp_exec_requires_bwrap_backend() {
+    fn execution_governance_ptrace_seccomp_exec_requires_bwrap_or_hakoniwa_backend() {
         let tmpdir = tempfile::tempdir().unwrap();
         let config_path = tmpdir.path().join(CONFIG_FILE_NAME);
         let toml = format!(
@@ -1853,6 +1886,87 @@ allowed_executables = ["/bin/bash"]
         assert_eq!(
             resolved.execution_governance,
             super::ExecutionGovernanceStrategy::PtraceSeccompExec
+        );
+    }
+
+    #[test]
+    fn execution_governance_ptrace_seccomp_exec_resolves_with_hakoniwa_and_enforced_allowlist() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let config_path = tmpdir.path().join(CONFIG_FILE_NAME);
+        let toml = r#"
+[run.profiles.codex]
+backend = "hakoniwa"
+sidecar_endpoint = "unix:///tmp/execution-governance-test-sidecar.sock"
+execution_governance = "ptrace_seccomp_exec"
+
+[run.profiles.codex.sidecar_local_exec]
+endpoint = "unix:///tmp/execution-governance-test.sock"
+timeout = "2s"
+enforce_known_executables = true
+allowed_executables = ["/bin/bash"]
+"#;
+        fs::write(&config_path, toml).unwrap();
+
+        let mut run_args = args("codex");
+        run_args.config = Some(config_path);
+
+        let resolved = resolve_profile(&run_args).unwrap();
+        assert_eq!(
+            resolved.execution_governance,
+            super::ExecutionGovernanceStrategy::PtraceSeccompExec
+        );
+    }
+
+    #[test]
+    fn execution_governance_ptrace_seccomp_exec_rejects_a_seccomp_policy_that_already_denies_execve()
+     {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let policy_path = tmpdir.path().join("policy.toml");
+        fs::write(
+            &policy_path,
+            r#"
+policy_id = "generic-local-command"
+policy_version = "v1"
+default_action = "allow"
+deny_actions = ["system.execute"]
+"#,
+        )
+        .unwrap();
+        let artifact_dir = tmpdir.path().join("artifacts");
+
+        let config_path = tmpdir.path().join(CONFIG_FILE_NAME);
+        let toml = format!(
+            r#"
+[run.profiles.codex]
+backend = "bwrap"
+sidecar_endpoint = "unix:///tmp/execution-governance-test-sidecar.sock"
+execution_governance = "ptrace_seccomp_exec"
+
+[run.profiles.codex.sidecar_local_exec]
+endpoint = "unix:///tmp/execution-governance-test.sock"
+timeout = "2s"
+enforce_known_executables = true
+allowed_executables = ["/bin/bash"]
+
+[run.profiles.codex.seccomp_policy]
+source_policy_path = '{}'
+artifact_dir = '{}'
+"#,
+            policy_path.display(),
+            artifact_dir.display()
+        );
+        fs::write(&config_path, toml).unwrap();
+
+        let mut run_args = args("codex");
+        run_args.config = Some(config_path);
+
+        let err = resolve_profile(&run_args).unwrap_err();
+        let RunError::ConfigValidation(message) = err else {
+            panic!("expected ConfigValidation, got {err:?}");
+        };
+        assert!(
+            message.contains("already denies 'system.execute'"),
+            "expected the deny-syscalls gate's own message, got: {message}"
         );
     }
 

@@ -48,6 +48,15 @@ impl AllowedExecutables {
     pub fn contains(&self, path: &Path) -> bool {
         self.0.contains(path)
     }
+
+    /// Iterates the allowed paths themselves.
+    ///
+    /// Used by [`ptrace_seccomp`]'s post-exec identity re-verification,
+    /// which needs to `stat` each allowed path (not just look one up by
+    /// exact path string) to compare by device+inode rather than by path.
+    pub fn paths(&self) -> impl Iterator<Item = &Path> {
+        self.0.iter().map(PathBuf::as_path)
+    }
 }
 
 /// State threaded from a governor's `rewrite_launch` to its own `supervise`.

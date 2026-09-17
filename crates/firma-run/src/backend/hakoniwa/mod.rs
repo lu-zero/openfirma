@@ -21,7 +21,7 @@ use crate::backend::{
     BackendKind, EnforcementProof, LaunchSpec, NetworkConfinement, PrepareRequest, SandboxBackend,
     SandboxHandle, SandboxMount,
 };
-use crate::config::NetworkPolicy;
+use crate::config::{ExecutionGovernanceStrategy, NetworkPolicy};
 use crate::error::RunError;
 
 mod mount;
@@ -219,6 +219,26 @@ impl SandboxBackend for HakoniwaBackend {
         let mut allowed_executables = launch.allowed_executables.clone();
         if !allowed_executables.is_empty() && env.contains_key("FIRMA_RUN_SELF_EXE") {
             allowed_executables.push(PathBuf::from(ORCHESTRATION_FIRMA_PATH));
+        }
+        // Same reasoning, for a selected `execution_governance` strategy's
+        // own launch-target rewrite: `ExecutionGovernor::rewrite_launch`
+        // (e.g. `PtraceSeccompExec`) may replace `launch.executable` with
+        // its own shim binary before `start_agent` ever runs — a path that
+        // is never itself a member of the operator's own
+        // `allowed_executables`. Discovered empirically running
+        // `PtraceSeccompExec` against a real Hakoniwa sandbox for the first
+        // time: without this, Landlock denied the shim's own exec outright,
+        // before it ever got a chance to install its own governance. This
+        // is deliberately generic over *which* strategy rewrote the target,
+        // not specific to `PtraceSeccompExec` — any non-`Inherited`
+        // strategy's rewritten launch target must be exec-able the same
+        // way, and any *further* descendant exec is still independently
+        // governed by both Landlock (this same allow-list, unchanged
+        // otherwise) and whatever the selected strategy itself enforces.
+        if !allowed_executables.is_empty()
+            && launch.execution_governance != ExecutionGovernanceStrategy::Inherited
+        {
+            allowed_executables.push(PathBuf::from(&launch.executable));
         }
 
         let contract = HakoniwaLaunchContract {

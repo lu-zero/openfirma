@@ -7,15 +7,16 @@
   subsection below). Post-implementation adversarial review obtained and
   found one critical defect (`aarch64`'s deny mechanism did not actually
   work as designed — see Slice 3c's own findings), fixed and independently
-  re-verified against real kernel behavior; one residual gap remains open
-  (cross-process TOCTOU on the checked-vs-executed file — see Slice 3c's
-  findings and "Risks and gaps"), not yet resolved and requiring its own
-  design decision. Pre-implementation: two independent review rounds
-  complete — the first invalidated by an unauthorized overwrite and
-  restored, then re-verified by a second, properly-scoped fresh reviewer
-  that additionally found and this document incorporated `PLAN-109`
-  through `PLAN-112`; see the note at the end of this section for full
-  provenance)
+  re-verified against real kernel behavior. That review's second finding
+  (a cross-process TOCTOU on the checked-vs-executed file) is now
+  mitigated by `DEC-019` (kill the process on a post-exec device+inode
+  mismatch) — this reduces the exposure window but does not eliminate it;
+  see `DEC-019` and Slice 3c's own findings for the residual scope.
+  Pre-implementation: two independent review rounds complete — the first
+  invalidated by an unauthorized overwrite and restored, then re-verified
+  by a second, properly-scoped fresh reviewer that additionally found and
+  this document incorporated `PLAN-109` through `PLAN-112`; see the note
+  at the end of this section for full provenance)
 - Durable locator: `docs/architecture/ptrace-seccomp-exec-gate-plan.md`, in-repo
 - Repository revision researched: `5e0dd567` (HEAD of `feat/backend-selection`
   at research time)
@@ -570,6 +571,102 @@
   plus a Yama-scope read produces a specific, actionable message instead of
   a bare kernel errno.
 
+### `DEC-019`: Post-exec identity re-verification — kill on a device+inode mismatch against `AllowedExecutables`
+
+- Choice: since `PTRACE_O_TRACEEXEC` is already set at seize time
+  (`DEC-013`), every successful `execve`/`execveat` anywhere in the traced
+  subtree also produces a `PTRACE_EVENT_EXEC` stop. At that stop,
+  additionally to `decide_and_continue`'s own pre-exec check, `stat` the
+  file now actually mapped as the process's executable
+  (`/proc/<tid>/exe`) and compare its device+inode against every allowed
+  path's own device+inode (each `stat`'d directly, from this process's
+  ordinary host view — those are real host paths already). If it matches
+  none of them, kill the process (`SIGKILL`) rather than continuing it.
+- Rationale and evidence: added post-implementation, in response to a
+  real adversarial-review finding — `decide_and_continue`'s own check
+  approves a target _before_ the real syscall runs, and nothing in this
+  design (not even `DEC-017`'s multi-thread freeze, which only covers
+  threads of the _same_ tracee) stops an independent second process able
+  to write to the resolved path from replacing the file there between
+  that approval and the kernel's own later lookup for the real syscall.
+  This is a defense-in-depth layer, not a replacement for closing the
+  race at its source: it cannot prevent the swapped file from executing
+  for the brief window between the exec completing and this stop being
+  observed, only from running any further than that. Comparing by
+  device+inode rather than path string is deliberate: reading
+  `/proc/<tid>/exe`'s target as a string and re-resolving _that_ string
+  from the tracer's own filesystem view would reproduce exactly the class
+  of bug `resolve_traced_exec_target` was built to avoid elsewhere in
+  this same file (see the child plan's own Slice 3b findings on
+  `SO_PEERCRED` vs. `/proc`-based pid discovery, and Slice 3c's
+  `/proc/<tid>/{root,cwd,fd/<n>}` resolution) — `std::fs::metadata`
+  called directly on the magic-link path itself is the one-syscall,
+  namespace-correct equivalent. Device+inode comparison also means a
+  legitimately bind-mounted alias of an allowed file is still recognized
+  correctly, rather than requiring path-string equality.
+- Consequences and rejected alternatives: closing the race at its source
+  (rewriting the traced syscall to `execveat` against a file descriptor
+  the tracer itself opened, verified, and injected into the tracee — the
+  only mechanism that would eliminate the window entirely) was considered
+  and deferred: it requires either a live `SCM_RIGHTS` channel to _every_
+  traced process (this design only maintains one to the root shim, torn
+  down after the initial handshake) or syscall injection via ptrace,
+  either of which is a materially larger design than this fix — tracked
+  as a follow-up, not part of this decision's own scope. Re-verifying via
+  the _path string_ rather than device+inode was considered and rejected
+  for the reason given above.
+
+### `DEC-020`: Extend `PtraceSeccompExec` to `HakoniwaBackend`, not `bwrap` only
+
+- Choice: widen `validate_execution_governance_preconditions`'s backend
+  check from `Bwrap`-only to `Bwrap | Hakoniwa`. No change to
+  `ptrace_seccomp.rs`'s own attach/decision logic was needed for pid
+  discovery — `HakoniwaBackend`'s runner forks once and that fork's pid is
+  already the one that becomes the wrapped command, so the existing
+  `SO_PEERCRED`-based discovery (added for `bwrap`, `DEC-012`'s
+  implementation finding) already generalizes: it identifies whoever
+  connects to the handshake socket, regardless of which backend's process
+  tree produced that connection.
+- Rationale and evidence: confirmed by dedicated research before
+  implementation (pid-discovery model, `runtime_dir` availability, seccomp
+  filter stacking semantics) and then empirically, against a real Hakoniwa
+  sandbox — not merely by analogy to `bwrap`.
+- Consequences and two more real integration issues, neither anticipated by
+  the research: (1) `rewrite_launch`'s shim path (`current_exe()`) is not
+  guaranteed visible inside the sandbox just because the sandbox itself
+  works — `HakoniwaBackend`'s `rootfs("/")` does not recursively cover
+  other host mounts (a dev checkout under a separate `/home` mount was
+  invisible, `ENOENT` on the shim's own re-exec) — fixed generally by
+  copying the shim into `sandbox_runtime_dir` (already guaranteed reachable
+  for the handshake socket) instead of referencing its host path directly,
+  benefiting `bwrap` too, not just a Hakoniwa-only patch; (2)
+  `HakoniwaBackend` already has its own, always-on Landlock-based
+  descendant-exec enforcement, completely independent of
+  `execution_governance` — it activates whenever `allowed_executables` is
+  non-empty, regardless of strategy, and since the shim's own path is never
+  itself in the operator's `allowed_executables`, Landlock denied the
+  shim's own exec outright. `LaunchSpec` gained an `execution_governance`
+  field so `HakoniwaBackend` can add its own (already-rewritten) launch
+  target to the Landlock allow-list whenever a non-`Inherited` strategy is
+  selected — generic over which strategy did the rewriting, not
+  `PtraceSeccompExec`-specific — after which Landlock and the selected
+  strategy both independently (and harmlessly redundantly) govern any
+  further descendant exec.
+- Open question, not resolved by this decision: `HakoniwaBackend`'s own
+  Landlock mechanism already solves the same problem `execution_governance`
+  exists to make selectable, unconditionally, regardless of which strategy
+  is nominally chosen — meaning `Inherited` on Hakoniwa is not actually
+  "root-command-only" the way it is on `bwrap`; Hakoniwa's descendant-exec
+  restriction is always on. Whether `HakoniwaBackend`'s own Landlock
+  construction should itself become conditional on `execution_governance`
+  (e.g. skipped when a different strategy is explicitly selected, so
+  `PtraceSeccompExec` becomes a genuine alternative mechanism rather than a
+  redundant, always-coexisting one — of practical value chiefly as a
+  fallback on kernels too old for Landlock) is a real design decision this
+  plan does not make; this session verified the combination _works_
+  (harmless redundancy) without deciding whether it _should remain_
+  redundant going forward.
+
 ## Architecture and invariant ownership
 
 - Architecture shape: one new module,
@@ -869,19 +966,33 @@ test are not sufficient proof for register-level, per-architecture
 kernel-interaction code — only a reproduction against the actual kernel
 source and observed behavior closed this gap.
 
+**`DEC-019` (added post-review) mitigates, but does not eliminate, the
+cross-process TOCTOU** the same review flagged: `handle_post_exec_verification`
+now re-checks the actually-executing file (`/proc/<tid>/exe`, by
+device+inode) at the `PTRACE_EVENT_EXEC` stop every successful exec
+already produces, and kills the process on a mismatch. This closes the
+_consequence_ (a swapped, unapproved binary running unchecked
+indefinitely) but not the _window_ itself — the swapped file still runs
+for the interval between the exec completing and this stop being
+observed and acted on, which this design cannot make zero. The
+comparison logic (`verify_post_exec_identity`) has its own direct unit
+tests (matching, non-matching, and empty-allow-list cases, using this
+test binary's own `/proc/<pid>/exe` as a real, non-racy stand-in for a
+traced process); the full "a genuine concurrent race is actually
+detected and killed" behavior has **not** been exercised end to end,
+since — matching the original review's own admission that it "could not
+construct a concrete cross-process race in the time available" —
+deterministically forcing that exact race in a repository test would
+require either a flaky timing-dependent test (rejected, matching this
+repository's own testing culture) or a dedicated synchronization harness
+that is its own, separate undertaking, not attempted here.
+
 Outstanding before this plan can be considered fully delivered: RHEL/
 CentOS Yama LSM presence remains Unknown, unchanged from the parent plan;
 `x86_64` confirmation requires real hardware this session did not have
-access to; the cross-process TOCTOU on the checked-vs-executed file
-(`DEC-017`'s freeze only covers sibling threads of the same tracee, not a
-second process able to replace the resolved path between the check and
-the tracee's own later `execve`) was flagged by the same
-post-implementation review as unclosed and not proven exploitable in the
-time available — a genuine residual gap, not newly introduced by this
-implementation, requiring its own design decision (e.g. inode-pinning via
-`O_PATH`, or re-verifying via `/proc/<tid>/exe` post-exec) before this
-strategy can be trusted against a hostile multi-process sandboxed
-workload, not just a hostile single-process one.
+access to; closing the TOCTOU window itself (rather than only its
+consequence, per `DEC-019`'s own "Consequences and rejected alternatives")
+remains a follow-up, not part of this plan's delivered scope.
 
 ## Risks and gaps
 

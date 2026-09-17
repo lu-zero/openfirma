@@ -285,6 +285,7 @@ mod tests {
             seccomp_filter_path: None,
             deny_syscalls: None,
             allowed_executables: Vec::new(),
+            execution_governance: crate::config::ExecutionGovernanceStrategy::Inherited,
             identity_mode: crate::config::SandboxIdentityMode::SandboxUser,
             config_file: None,
             trust_anchor: None,

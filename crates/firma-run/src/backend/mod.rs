@@ -16,7 +16,8 @@ use firma_identifiers::SandboxId;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{
-    MountSpec, NetworkPolicy, ResolvedProfile, SandboxIdentityMode, SidecarEndpoint,
+    ExecutionGovernanceStrategy, MountSpec, NetworkPolicy, ResolvedProfile, SandboxIdentityMode,
+    SidecarEndpoint,
 };
 use crate::env::ExecutionEnv;
 use crate::error::RunError;
@@ -364,12 +365,34 @@ pub struct LaunchSpec {
     /// Consumed only by `HakoniwaBackend`, which scopes Landlock's execute
     /// right to this set so the restriction reaches descendant processes too
     /// (FIR-366), not just the root command `mediator.allowed_executables`
-    /// already gates once at launch time.
+    /// already gates once at launch time — *unless* `execution_governance`
+    /// has selected a different, explicit descendant-exec mechanism (see
+    /// that field's own doc comment), in which case `HakoniwaBackend` defers
+    /// to it instead of also building its own, conflicting Landlock rule.
     #[cfg_attr(
         not(target_os = "linux"),
         expect(dead_code, reason = "landlock is consumed only by the Linux backend")
     )]
     pub(crate) allowed_executables: Vec<PathBuf>,
+    /// The selected descendant-exec governance strategy (`Inherited` is
+    /// today's default: root-command-only, via `mediator`).
+    ///
+    /// Consumed only by `HakoniwaBackend`: `PtraceSeccompExec` rewrites the
+    /// launch target to its own shim binary (`ExecutionGovernor::
+    /// rewrite_launch`), a path that is never itself a member of
+    /// `allowed_executables` — building a Landlock ruleset from that set
+    /// regardless of strategy would deny the shim's own exec outright,
+    /// discovered empirically running `PtraceSeccompExec` against a real
+    /// Hakoniwa sandbox for the first time (Hakoniwa's own Landlock
+    /// enforcement predates and does not know about this newer, selectable
+    /// axis). `HakoniwaBackend` skips its own Landlock construction whenever
+    /// this is anything other than `Inherited`, deferring descendant-exec
+    /// enforcement entirely to whichever strategy was explicitly selected.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        expect(dead_code, reason = "landlock is consumed only by the Linux backend")
+    )]
+    pub(crate) execution_governance: ExecutionGovernanceStrategy,
     pub(crate) identity_mode: SandboxIdentityMode,
     /// Resolved `firma.toml` the agent is running under, if any.
     ///

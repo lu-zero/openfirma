@@ -398,6 +398,136 @@ fn spawn_allow_all_endpoint(sock_path: &Path, log: Arc<Mutex<Vec<String>>>) {
     });
 }
 
+/// Shell logic for the shared forbidden-tool probe: prints a marker to stdout and touches a marker
+/// file if it ever runs.
+const FORBIDDEN_MARKER: &str = "FORBIDDEN-TOOL EXECUTED";
+
+/// Writes an executable script to `path` that prints [`FORBIDDEN_MARKER`] and touches `marker` if
+/// it ever runs. Mirrors `child_process_governance::support::write_forbidden_tool` (not reused
+/// directly — see `patch_local_exec_allowlist`'s own doc comment for why this file keeps its own
+/// copies of these small test-only helpers rather than sharing a private sibling module).
+fn write_forbidden_tool(path: &Path, marker: &Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let script = format!(
+        "#!/bin/sh\necho \"{FORBIDDEN_MARKER} pid=$$ argv=$*\"\n: > '{}'\n",
+        marker.display(),
+    );
+    std::fs::write(path, script).expect("write forbidden-tool");
+    let mut permissions = std::fs::metadata(path)
+        .expect("stat forbidden-tool")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(path, permissions).expect("chmod forbidden-tool");
+}
+
+/// Rewrites the scaffolded hakoniwa profile to also select
+/// `execution_governance = "ptrace_seccomp_exec"`.
+///
+/// Runs after [`patch_local_exec_allowlist`], which already leaves the profile's
+/// `sidecar_local_exec` satisfying this strategy's own config-time precondition
+/// (`enforce_known_executables = true` with a non-empty `allowed_executables`).
+fn select_ptrace_seccomp_exec_governance(config_path: &Path) {
+    let original = std::fs::read_to_string(config_path).expect("read patched firma.toml");
+    let anchor = "backend = \"hakoniwa\"\n";
+    assert!(
+        original.contains(anchor),
+        "expected the hakoniwa backend line patch_local_exec_allowlist leaves in place:\n{original}"
+    );
+    let patched = original.replacen(
+        anchor,
+        "backend = \"hakoniwa\"\nexecution_governance = \"ptrace_seccomp_exec\"\n",
+        1,
+    );
+    std::fs::write(config_path, patched).expect("write execution_governance selection");
+}
+
+/// `PtraceSeccompExec` on `HakoniwaBackend` — proves the same ptrace(2)-based descendant-exec
+/// governance built for `bwrap` (`docs/architecture/ptrace-seccomp-exec-gate-plan.md`) also works
+/// correctly against a real Hakoniwa sandbox, not just as a config-resolution possibility.
+/// `hakoniwa_backend_restricts_descendant_exec_via_landlock` already proves Hakoniwa has its own,
+/// separate native answer to this same problem (Landlock); this test proves the *alternative*
+/// mechanism is real too, e.g. for hosts where Landlock is unavailable (older kernels) but
+/// `ptrace(2)` still works.
+#[test]
+fn hakoniwa_backend_denies_forbidden_tool_via_ptrace_seccomp_exec() {
+    let Some(runner) = hakoniwa_runner_path() else {
+        eprintln!(
+            "skipping hakoniwa_backend_denies_forbidden_tool_via_ptrace_seccomp_exec: \
+             firma-hakoniwa-runner was not built"
+        );
+        return;
+    };
+    let bash = first_existing(&["/usr/bin/bash", "/bin/bash"])
+        .unwrap_or_else(|| panic!("bash must be installed in the test environment"));
+    let bash_canonical =
+        std::fs::canonicalize(&bash).expect("canonicalize bash for allowed_executables");
+
+    let world = TestWorld::isolated();
+    let cfg_dir = world.path("config");
+    let state_dir = world.state_path();
+    let workspace = world.workspace_path();
+
+    let forbidden_tool = workspace.join("forbidden-tool");
+    let forbidden_marker = workspace.join("forbidden-ran");
+    write_forbidden_tool(&forbidden_tool, &forbidden_marker);
+
+    world.scaffold_config(
+        "generic",
+        &cfg_dir,
+        &state_dir,
+        Some(&workspace),
+        &workspace,
+    );
+    let config_path = cfg_dir.join("firma.toml");
+    patch_backend_to_hakoniwa(&config_path);
+
+    let traffic_sock = world.path("state/hakoniwa-ptrace-sidecar.sock");
+    let governance_sock = world.path("state/hakoniwa-ptrace-governance.sock");
+    patch_local_exec_allowlist(
+        &config_path,
+        &traffic_sock,
+        &governance_sock,
+        &bash_canonical,
+    );
+    select_ptrace_seccomp_exec_governance(&config_path);
+
+    let governed = Arc::new(Mutex::new(Vec::<String>::new()));
+    spawn_allow_all_endpoint(&governance_sock, Arc::clone(&governed));
+
+    let bash_script = format!(
+        "{tool} as-child-of-bash; echo \"bash-done exit=$?\"",
+        tool = forbidden_tool.display(),
+    );
+    let mut command = world.isolated_command_in(env!("CARGO_BIN_EXE_firma"), &workspace);
+    command
+        .env("FIRMA_RUN_HAKONIWA_RUNNER", &runner)
+        .args(["run", "--profile", "generic", "--config"])
+        .arg(&config_path)
+        .args(["--sidecar", "local", "--authority", "local", "--"])
+        .arg(&bash)
+        .arg("-c")
+        .arg(&bash_script);
+    let output = run_bounded(&mut command, Duration::from_mins(2));
+
+    assert!(
+        output.stdout.contains("bash-done"),
+        "the allowed bash root did not run at all under hakoniwa + ptrace_seccomp_exec:\n{output}"
+    );
+    assert!(
+        !forbidden_marker.exists() && !output.stdout.contains(FORBIDDEN_MARKER),
+        "FIR-366: the forbidden-tool child executed under hakoniwa + ptrace_seccomp_exec \
+         governance:\n{output}"
+    );
+
+    let governed = governed.lock().expect("lock governance log").clone();
+    assert_eq!(
+        governed.len(),
+        1,
+        "expected exactly one governance request for the root command: {governed:?}"
+    );
+}
+
 /// DNS-stub/proxy-bridge/watchdog/env-strip orchestration — Slice 3 of
 /// `docs/architecture/hakoniwa-backend-plan.md` (`DEC-003`).
 ///

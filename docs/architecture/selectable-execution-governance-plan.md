@@ -2,7 +2,7 @@
 
 ## Artifact metadata
 
-- Status: Partially implemented — Slice 1 and Slice 3 (`PtraceSeccompExec`, elaborated by its own child plan) landed; Slice 2 (`LandlockExecute`) and Slice 4 (parametrized coverage/benchmarks) not started. Post-implementation adversarial review of Slice 3 has been obtained: it found and this implementation fixed a critical defect (aarch64's deny mechanism did not actually work), independently re-verified; one residual gap (a cross-process TOCTOU) remains open. (Independent plan review complete pre-implementation, all findings corrected — see "Plan-review findings and dispositions")
+- Status: Partially implemented — Slice 1 and Slice 3 (`PtraceSeccompExec`, elaborated by its own child plan) landed; Slice 2 (`LandlockExecute`) and Slice 4 (parametrized coverage/benchmarks) not started. Post-implementation adversarial review of Slice 3 has been obtained: it found and this implementation fixed a critical defect (aarch64's deny mechanism did not actually work), independently re-verified. That review's second finding (a cross-process TOCTOU) is now mitigated by a post-exec identity re-verification (kills the process on a mismatch) but not eliminated — see the child plan's `DEC-019`. (Independent plan review complete pre-implementation, all findings corrected — see "Plan-review findings and dispositions")
 - Durable locator: `docs/architecture/selectable-execution-governance-plan.md` (this file, in-repo)
 - Repository revision researched: `9d761b2b36afa69c32eb1a5cc66e8b9ba45dc34a`
 - Task or requirement source: `~/Sources/openfirma-notes/requirements.md` (Workstream 2), user request to make governance mechanisms selectable at runtime from one binary so Workstream 2 candidates can be benchmarked side by side
@@ -216,8 +216,11 @@ acceptance scenario passes under `PtraceSeccompExec`
 (`ptrace_seccomp_exec_denies_forbidden_tool_as_child_of_allowed_bash_root`)
 while `Inherited`'s own control test continues to fail as expected.
 Post-implementation adversarial review has been obtained (per this plan's
-own "Final verification" below); one residual gap remains open (a
-cross-process TOCTOU on the checked-vs-executed file), not yet resolved.
+own "Final verification" below); its second finding (a cross-process
+TOCTOU on the checked-vs-executed file) is now mitigated by a post-exec
+identity re-verification (`DEC-019` in the child plan: kills the process
+on a device+inode mismatch against `AllowedExecutables`) — this narrows
+the exposure window but does not eliminate it.
 
 ### Slice 4: parametrized coverage and Workstream 2 evidence
 

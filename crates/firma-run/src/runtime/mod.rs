@@ -258,8 +258,9 @@ pub fn execute_run(args: &RunInput, hooks: &LaunchHooks<'_>) -> Result<i32, RunE
                 .as_ref()
                 .ok_or_else(|| RunError::Internal("sandbox handle missing".to_string()))?;
             let effective_seccomp = resolve_effective_seccomp(&profile)?;
-            let deny_syscalls = crate::seccomp::resolve_deny_syscall_names(&profile)?
-                .map(|names| names.into_iter().map(str::to_string).collect());
+            let deny_syscalls =
+                crate::seccomp::resolve_deny_syscall_names(profile.seccomp_policy.as_ref())?
+                    .map(|names| names.into_iter().map(str::to_string).collect());
             if let Some(materialized) = &effective_seccomp {
                 tracing::info!(
                     policy_id = %materialized.metadata.policy_id,
@@ -326,6 +327,7 @@ pub fn execute_run(args: &RunInput, hooks: &LaunchHooks<'_>) -> Result<i32, RunE
                 seccomp_filter_path: effective_seccomp.as_ref().map(|s| s.bpf_path.clone()),
                 deny_syscalls,
                 allowed_executables: allowed_executables.into_iter().collect(),
+                execution_governance: profile.execution_governance,
                 identity_mode: profile.identity_mode,
                 config_file: user_config_path.clone(),
                 trust_anchor,

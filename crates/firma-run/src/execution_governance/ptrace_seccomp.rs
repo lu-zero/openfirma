@@ -347,6 +347,31 @@ impl ExecutionGovernor for PtraceSeccompGovernor {
             RunError::Internal(format!("exec guard: locate current executable: {error}"))
         })?;
 
+        // Copied into `sandbox_runtime_dir` rather than referenced at its
+        // own host path directly: a backend's mount plan is not guaranteed
+        // to make *wherever this binary happens to be installed* visible
+        // inside the sandbox just because the sandbox itself works — bwrap's
+        // typically-broad default mount coverage happens to include it, but
+        // `HakoniwaBackend`'s `rootfs("/")` does not recursively cover other
+        // host mounts (confirmed empirically: a dev checkout under a
+        // separate `/home` mount was invisible inside a real Hakoniwa
+        // sandbox, failing this shim's own re-exec with `ENOENT`, even
+        // though standard system paths like `/usr/bin/bash` worked fine).
+        // `sandbox_runtime_dir` is the one location this module already
+        // knows is reachable regardless of backend (it is where the
+        // handshake socket above lives), so copying here removes the
+        // dependency on incidental mount coverage entirely.
+        // `std::fs::copy` preserves the source's permission bits (including
+        // the executable bit), so no separate `chmod` is needed.
+        let shim_path = sandbox_runtime_dir.join("firma-exec-guard-shim");
+        std::fs::copy(&firma_exe, &shim_path).map_err(|error| {
+            RunError::Internal(format!(
+                "exec guard: copy {} to {}: {error}",
+                firma_exe.display(),
+                shim_path.display()
+            ))
+        })?;
+
         let mut new_args = vec![
             "__exec-guarded-run".to_string(),
             "--handshake-socket".to_string(),
@@ -356,7 +381,7 @@ impl ExecutionGovernor for PtraceSeccompGovernor {
         ];
         new_args.append(args);
 
-        *executable = firma_exe.to_string_lossy().into_owned();
+        *executable = shim_path.to_string_lossy().into_owned();
         *args = new_args;
 
         Ok(GovernanceHandle::PtraceSeccompExec(Handle {
@@ -565,9 +590,11 @@ fn ptrace_wait_loop(root: Pid, allowed: &AllowedExecutables) -> Result<i32, RunE
             WaitStatus::PtraceEvent(pid, _signal, event) => {
                 if event == ptrace::Event::PTRACE_EVENT_SECCOMP as i32 {
                     handle_seccomp_trap(pid, allowed);
+                } else if event == ptrace::Event::PTRACE_EVENT_EXEC as i32 {
+                    handle_post_exec_verification(pid, allowed);
                 } else {
-                    // fork/vfork/clone/exec notifications: nothing to
-                    // decide, just let the tracee proceed.
+                    // fork/vfork/clone notifications: nothing to decide,
+                    // just let the tracee proceed.
                     let _ = ptrace::cont(pid, None);
                 }
             }
@@ -658,6 +685,71 @@ fn decide_and_continue(tid: Pid, allowed: &AllowedExecutables) -> Result<(), Run
     }
     ptrace::cont(tid, None)
         .map_err(|error| RunError::Internal(format!("exec guard: continue {tid}: {error}")))
+}
+
+// ── `DEC-019`: post-exec identity re-verification ───────────────────────────
+//
+// `decide_and_continue`'s own check (above) resolves and approves a target
+// *before* the real `execve`/`execveat` runs; nothing prevents a second,
+// independent process (not a thread of this same tracee — `DEC-017`'s
+// freeze only covers those) from replacing the file at that path between
+// the approval and the kernel's own later lookup for the real syscall.
+// `PTRACE_O_TRACEEXEC` (already set at seize time, `DEC-013`) means every
+// successful exec anywhere in the traced subtree also produces a
+// `PTRACE_EVENT_EXEC` stop; this uses that stop to re-check, this time
+// against the file that is now *actually* mapped as the process's
+// executable (`/proc/<tid>/exe`), and kills the process outright if it
+// does not match any allowed executable — a defense-in-depth layer that
+// cannot prevent the swapped file from executing for the brief window
+// between the exec completing and this stop being observed, but does
+// prevent it from running any further than that.
+//
+// Compared by device+inode, not by path string: `/proc/<tid>/exe` is
+// itself a magic link (same class as `/proc/<tid>/root`), and *reading*
+// its target as a string and re-resolving that string from this (the
+// tracer's) own filesystem view would reproduce exactly the kind of bug
+// `resolve_traced_exec_target` avoids elsewhere in this file — instead,
+// `std::fs::metadata` is called directly on the magic-link path itself
+// (one syscall, resolved by the kernel in the tracee's own context), and
+// the resulting device+inode is compared against each allowed path's own
+// device+inode (stat'd from this process's ordinary, host view — those
+// paths are real host paths already, not sandbox-namespace-relative).
+// Device+inode identity, not path equality, also means a legitimately
+// bind-mounted alias of an allowed file is still recognized correctly.
+
+/// Handles one `PTRACE_EVENT_EXEC` stop: verifies the process's now-actual
+/// executable is one of `allowed` by device+inode identity, continuing it
+/// if so and killing it outright if not.
+fn handle_post_exec_verification(tid: Pid, allowed: &AllowedExecutables) {
+    if verify_post_exec_identity(tid, allowed) {
+        let _ = ptrace::cont(tid, None);
+        return;
+    }
+    tracing::error!(
+        %tid,
+        "execution governance: post-exec identity mismatch — the executing file is not one of \
+         allowed_executables despite passing the pre-exec check; killing the process (this is \
+         the observable signature of a TOCTOU race on the checked file, not an expected outcome)"
+    );
+    let _ = nix::sys::signal::kill(tid, nix::sys::signal::Signal::SIGKILL);
+}
+
+/// Compares the file now actually mapped as `tid`'s executable against
+/// `allowed`, by device+inode rather than path string (see the module
+/// section comment above for why). Fails closed (`false`) on any I/O
+/// error — an unreadable `/proc/<tid>/exe` or an allowed path that no
+/// longer stats cleanly must not be treated as a pass.
+fn verify_post_exec_identity(tid: Pid, allowed: &AllowedExecutables) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let Ok(exec_metadata) = std::fs::metadata(format!("/proc/{tid}/exe")) else {
+        return false;
+    };
+    let executing = (exec_metadata.dev(), exec_metadata.ino());
+
+    allowed.paths().any(|path| {
+        std::fs::metadata(path).is_ok_and(|metadata| (metadata.dev(), metadata.ino()) == executing)
+    })
 }
 
 /// Freezes every other thread sharing `trapped`'s address space (`DEC-017`).
@@ -1083,7 +1175,10 @@ fn set_syscall_return_value(regs: &mut libc::user_regs_struct, value: i64) {
 
 #[cfg(test)]
 mod tests {
-    use super::{install_and_wait_for_ready, is_confirmed_architecture};
+    use nix::unistd::Pid;
+
+    use super::super::AllowedExecutables;
+    use super::{install_and_wait_for_ready, is_confirmed_architecture, verify_post_exec_identity};
 
     #[test]
     fn install_and_wait_for_ready_fails_closed_when_handshake_socket_is_unreachable() {
@@ -1108,5 +1203,42 @@ mod tests {
         assert!(!is_confirmed_architecture("x86_64"));
         assert!(!is_confirmed_architecture("riscv64"));
         assert!(!is_confirmed_architecture(""));
+    }
+
+    /// `DEC-019`'s comparison logic, exercised directly rather than only
+    /// through a real ptrace race (which cannot be forced deterministically
+    /// — the same limitation the post-implementation review that motivated
+    /// this decision itself ran into). `/proc/<pid>/exe` for this test's
+    /// own pid resolves to the test binary itself, so no child process or
+    /// ptrace attach is needed to exercise the identity comparison.
+    #[test]
+    fn verify_post_exec_identity_matches_the_actual_running_binary() {
+        let this_pid = Pid::from_raw(i32::try_from(std::process::id()).unwrap());
+        let this_exe = std::env::current_exe().expect("resolve current test binary");
+
+        let allowed = AllowedExecutables::new(std::iter::once(this_exe).collect());
+        assert!(verify_post_exec_identity(this_pid, &allowed));
+    }
+
+    #[test]
+    fn verify_post_exec_identity_rejects_an_unrelated_allowed_set() {
+        let this_pid = Pid::from_raw(i32::try_from(std::process::id()).unwrap());
+        // A real, stat-able file that is certainly not this test binary's
+        // own inode.
+        let unrelated = ["/usr/bin/true", "/bin/true"]
+            .into_iter()
+            .map(std::path::PathBuf::from)
+            .find(|path| path.exists())
+            .expect("a `true` binary must exist in the test environment");
+
+        let allowed = AllowedExecutables::new(std::iter::once(unrelated).collect());
+        assert!(!verify_post_exec_identity(this_pid, &allowed));
+    }
+
+    #[test]
+    fn verify_post_exec_identity_fails_closed_on_an_empty_allowed_set() {
+        let this_pid = Pid::from_raw(i32::try_from(std::process::id()).unwrap());
+        let allowed = AllowedExecutables::default();
+        assert!(!verify_post_exec_identity(this_pid, &allowed));
     }
 }

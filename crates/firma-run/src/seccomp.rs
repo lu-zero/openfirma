@@ -55,8 +55,12 @@ pub(crate) fn resolve_effective_seccomp(
 /// Shared by any backend that wants the same logical policy source `resolve_effective_seccomp`
 /// compiles for the bwrap backend, but applies it through its own mechanism instead of a static
 /// BPF blob — e.g. `HakoniwaBackend`, which builds a `hakoniwa::seccomp::Filter` directly (see
-/// `docs/architecture/hakoniwa-backend-plan.md`, `DEC-004`). Returns `Ok(None)` when the profile
-/// has no seccomp policy configured, matching `resolve_effective_seccomp`'s own shape.
+/// `docs/architecture/hakoniwa-backend-plan.md`, `DEC-004`). Returns `Ok(None)` when no seccomp
+/// policy is configured, matching `resolve_effective_seccomp`'s own shape.
+///
+/// Takes the policy directly (not a whole `ResolvedProfile`) so config-resolution's own
+/// `execution_governance` precondition check can call this before a `ResolvedProfile` exists yet
+/// (see `validate_execution_governance_preconditions`'s own `deny_syscalls` guard).
 ///
 /// # Errors
 ///
@@ -65,9 +69,9 @@ pub(crate) fn resolve_effective_seccomp(
 /// architecture support, since callers of this function are not restricted to
 /// `TargetArch::{X86_64, Aarch64}`.
 pub(crate) fn resolve_deny_syscall_names(
-    profile: &ResolvedProfile,
+    seccomp_policy: Option<&SeccompPolicyConfig>,
 ) -> Result<Option<Vec<&'static str>>, RunError> {
-    let Some(managed) = &profile.seccomp_policy else {
+    let Some(managed) = seccomp_policy else {
         return Ok(None);
     };
     let parsed_policy = parse_policy_source(&managed.source_policy_path)?;
