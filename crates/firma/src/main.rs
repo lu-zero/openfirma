@@ -31,6 +31,7 @@ fn main() -> ExitCode {
         #[cfg(target_os = "linux")]
         Command::EgressGuardedRun(a) => services::egress_guarded_run::run(a),
         Command::Doctor(a) => Ok(services::doctor::run(a, config.as_deref())),
+        Command::MappingRules(a) => services::mapping_rules::run(&a, config.as_deref()),
         Command::Config(a) => services::config::run(&a),
         Command::Control(a) => services::control::run(&a, config.as_deref()),
         Command::Policy(a) => services::policy::run(a),

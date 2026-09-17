@@ -343,6 +343,14 @@ impl ActionClassRegistry {
         self.classes.contains_key(name)
     }
 
+    /// Iterate every registered action class name — consulted by the
+    /// mapping-rules prover's `INV-002` check
+    /// (`docs/architecture/mapping-rules-prover-plan.md`) to find classes no
+    /// mapping rule or Composio catalog entry ever produces.
+    pub(crate) fn class_names(&self) -> impl Iterator<Item = &str> {
+        self.classes.keys().copied()
+    }
+
     /// Get the definition for an action class.
     #[cfg(test)]
     #[must_use]

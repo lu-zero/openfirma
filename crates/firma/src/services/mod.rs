@@ -7,6 +7,7 @@ pub mod dns_stub;
 pub mod doctor;
 #[cfg(target_os = "linux")]
 pub mod egress_guarded_run;
+pub mod mapping_rules;
 pub mod monitor;
 pub mod policy;
 pub mod proxy_bridge;

@@ -133,6 +133,7 @@ export default defineConfig({
             { label: 'Enable HTTPS MITM', slug: 'guides/https-mitm' },
             { label: 'Govern Composio tool execution', slug: 'guides/composio' },
             { label: 'Extend the action-class mapping', slug: 'guides/extend-mapping' },
+            { label: 'Validate mapping rules offline (firma mapping-rules)', slug: 'guides/validate-mapping-rules' },
             { label: 'Inject credentials', slug: 'guides/inject-credentials' },
             { label: 'Rehydrate & mask secrets (secret gateway)', slug: 'guides/secret-gateway' },
             { label: 'Read & verify the audit log', slug: 'guides/audit-log' },

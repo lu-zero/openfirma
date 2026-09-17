@@ -4,6 +4,7 @@ pub mod authority;
 pub mod config;
 pub mod control;
 pub mod doctor;
+pub mod mapping_rules;
 pub mod monitor;
 pub mod policy;
 pub mod run;
@@ -107,6 +108,9 @@ pub enum Command {
     EgressGuardedRun(run::EgressGuardedRunArgs),
     /// Diagnose a Firma install. Run this first when `firma run` misbehaves.
     Doctor(doctor::Args),
+    /// Check a mapping-rules configuration offline: unreachable rules and
+    /// registry classes no rule or Composio catalog entry ever produces.
+    MappingRules(mapping_rules::MappingRulesArgs),
     /// Tail audit decisions and component logs. Use `--source` to switch log streams.
     Monitor(monitor::Args),
     /// Internal proxy bridge for sandbox.

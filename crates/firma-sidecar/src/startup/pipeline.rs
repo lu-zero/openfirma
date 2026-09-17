@@ -40,7 +40,21 @@ pub struct PipelineRuntime {
 }
 
 /// Load and merge mapping rule files from `config`.
-fn load_mapping_rules(config: &config::SidecarConfig) -> anyhow::Result<config::MappingRulesFile> {
+///
+/// Exposed beyond this module (`DEC-007`,
+/// `docs/architecture/mapping-rules-prover-plan.md`) so the
+/// `firma mapping-rules validate` CLI subcommand resolves rule files
+/// identically to Sidecar startup — reusing this function directly rather
+/// than reimplementing the same resolution avoids the two ever silently
+/// drifting apart.
+///
+/// # Errors
+///
+/// Returns an error when a configured file can't be read, parsed, or fails
+/// its own structural validation.
+pub fn load_mapping_rules(
+    config: &config::SidecarConfig,
+) -> anyhow::Result<config::MappingRulesFile> {
     let mut all_rules: Vec<config::MappingRuleConfig> = Vec::new();
 
     let primary_path = &config.enforcement.mapping.rules_path;

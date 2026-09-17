@@ -60,7 +60,9 @@ fn provider_for_host(host: &Authority) -> Option<&'static str> {
     }
 }
 
-pub use self::mapping::{MappingTable, MatchResult};
+pub use self::mapping::{
+    MappingTable, MatchResult, OrphanedActionClass, find_orphaned_action_classes,
+};
 pub use crate::enforcement::decision::{EnforcementDecision, EnforcementStage};
 use crate::enforcement::error::EnforcementError;
 

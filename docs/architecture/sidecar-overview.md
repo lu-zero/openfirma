@@ -229,6 +229,16 @@ canonical `action_class` drawn from the v0.1 Action Class Registry
 `set-cookie`, `proxy-authorization`, `x-api-key`) before they enter
 the envelope. No LLM, no heuristic classifier on the hot path.
 
+`MappingTable::from_config` fails closed at load time on a duplicate
+`(method, host, path)` tuple, an action class outside the registry, or —
+since `docs/architecture/mapping-rules-prover-plan.md` — a rule sharing an
+exact `(host, path)` tuple with other rules whose combined method coverage
+already claims every method it could itself match, making it permanently
+unreachable. `firma mapping-rules validate` checks a configuration against
+this and a second, advisory registry-reachability property offline, before
+deployment — see
+<https://firma-ai.github.io/openfirma/guides/validate-mapping-rules/>.
+
 ### 5.2 Stage 1 — Capability Validation
 
 1. Select a token from the `CapabilityMap` keyed by

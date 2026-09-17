@@ -41,7 +41,9 @@ use crate::enforcement::decision::{ConstraintEnforcementStage, DenyIdentity, Enf
 pub use crate::enforcement::registry::ActionClassRegistry;
 use crate::enforcement::session::Outcome;
 use crate::normalizer::NormalizedEnvelope;
-pub use crate::normalizer::{IntentNormalizer, MappingTable, RawRequest};
+pub use crate::normalizer::{
+    IntentNormalizer, MappingTable, OrphanedActionClass, RawRequest, find_orphaned_action_classes,
+};
 use firma_config_schema::sidecar::SidecarMode;
 
 /// Default `retry_after_ms` surfaced to the agent for an AARM R4 `STEP_UP`

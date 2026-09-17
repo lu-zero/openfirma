@@ -242,6 +242,58 @@ fn find_shadowed_rule<'a>(rules: impl Iterator<Item = &'a MappingRule>) -> Optio
     None
 }
 
+/// Action classes producible only via runtime reclassification, not any
+/// static mapping rule or Composio catalog entry — consulted by
+/// [`find_orphaned_action_classes`]. Today: `code.destructive`, from
+/// `enrich_github_git_metadata`'s `git-receive-pack` delete path
+/// (`normalizer/mod.rs`). A hard-coded, documented list rather than a
+/// static analyzer over reclassification functions — see
+/// `docs/architecture/mapping-rules-prover-plan.md`, `DEC-005`. Adding a new
+/// dynamic-reclassification path elsewhere must extend this list by hand.
+const DYNAMIC_RECLASSIFICATION_EXEMPTIONS: &[&str] = &["code.destructive"];
+
+/// One `INV-002` finding: a registry class that no static mapping rule, no
+/// Composio catalog entry, and no [`DYNAMIC_RECLASSIFICATION_EXEMPTIONS`]
+/// entry ever produces.
+///
+/// Advisory only — consumed by the `firma mapping-rules validate` CLI,
+/// never by Sidecar startup (`DEC-003`). Does not, and by construction
+/// cannot, account for a class governed solely through an operator's own
+/// `firma-run` `deny_actions` config (`DEC-006`): such a class still
+/// surfaces here despite legitimate use elsewhere — a disclosed limitation,
+/// not a defect. See `docs/architecture/mapping-rules-prover-plan.md`,
+/// `INV-002`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrphanedActionClass {
+    pub class: String,
+}
+
+/// Finds every `registry` class that no rule in `rules`, no entry in
+/// `composio_action_classes`, and no [`DYNAMIC_RECLASSIFICATION_EXEMPTIONS`]
+/// entry produces.
+#[must_use]
+pub fn find_orphaned_action_classes<'a>(
+    rules: &'a MappingRulesFile,
+    composio_action_classes: impl Iterator<Item = &'a str>,
+    registry: &ActionClassRegistry,
+) -> Vec<OrphanedActionClass> {
+    let mut producible: std::collections::HashSet<&str> = rules
+        .rules
+        .iter()
+        .map(|rule| rule.action_class.as_str())
+        .collect();
+    producible.extend(composio_action_classes);
+    producible.extend(DYNAMIC_RECLASSIFICATION_EXEMPTIONS.iter().copied());
+
+    registry
+        .class_names()
+        .filter(|class| !producible.contains(class))
+        .map(|class| OrphanedActionClass {
+            class: class.to_string(),
+        })
+        .collect()
+}
+
 impl MappingTable {
     /// Load and validate mapping rules from a parsed config.
     ///
@@ -758,6 +810,107 @@ mod tests {
             let actual = find_shadowed_rule(rules.iter());
             let expected = oracle_first_shadowed(&rules);
             proptest::prop_assert_eq!(actual, expected);
+        }
+    }
+
+    fn shipped_mapping_file(filename: &str) -> MappingRulesFile {
+        let path = format!(
+            "{}/config/mappings/{}",
+            env!("CARGO_MANIFEST_DIR"),
+            filename
+        );
+        let src = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {filename}: {e}"));
+        toml::from_str(&src).unwrap_or_else(|e| panic!("parse {filename}: {e}"))
+    }
+
+    #[test]
+    fn unproduced_class_is_reported_as_orphaned() {
+        let file = MappingRulesFile {
+            rules: vec![rule(Some(Method::GET), "filesystem.read")],
+        };
+        let findings =
+            find_orphaned_action_classes(&file, std::iter::empty(), &ActionClassRegistry::v0_1());
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.class == "communication.external.send"),
+            "expected communication.external.send to be reported orphaned, got {findings:?}"
+        );
+        assert!(
+            !findings.iter().any(|f| f.class == "filesystem.read"),
+            "filesystem.read is produced by a mapping rule and must not be orphaned"
+        );
+    }
+
+    #[test]
+    fn dynamic_reclassification_exemption_is_not_orphaned() {
+        // No mapping rule and no Composio catalog entry produces
+        // `code.destructive` directly -- it only ever appears via
+        // `enrich_github_git_metadata`'s runtime reclassification -- so it
+        // must be exempted, not flagged (DEC-005).
+        let file = MappingRulesFile { rules: vec![] };
+        let findings =
+            find_orphaned_action_classes(&file, std::iter::empty(), &ActionClassRegistry::v0_1());
+        assert!(
+            !findings.iter().any(|f| f.class == "code.destructive"),
+            "code.destructive must be exempted (DEC-005), got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn composio_catalog_classes_are_not_orphaned() {
+        // Classes the real shipped Composio catalogs produce must be
+        // recognized as covered when their action classes are passed in,
+        // confirming DEC-006's "Composio catalog is a second producer"
+        // reasoning against real data, not a hypothetical.
+        let file = MappingRulesFile { rules: vec![] };
+        let catalogs = crate::composio::ComposioCatalogs::builtin()
+            .expect("shipped Composio catalogs must load");
+        let composio_classes: Vec<&str> = catalogs.action_classes().collect();
+        assert!(
+            !composio_classes.is_empty(),
+            "sanity check: the shipped catalogs must produce at least one class"
+        );
+
+        let findings = find_orphaned_action_classes(
+            &file,
+            composio_classes.iter().copied(),
+            &ActionClassRegistry::v0_1(),
+        );
+        for class in &composio_classes {
+            assert!(
+                !findings.iter().any(|f| &f.class == class),
+                "{class} is produced by the Composio catalog and must not be orphaned"
+            );
+        }
+    }
+
+    #[test]
+    fn shipped_github_toml_leaves_no_unexpected_orphans() {
+        // Real shipped config, not a synthetic fixture: every class either
+        // a mapping rule, the Composio catalogs, or DEC-005's exemption
+        // list produces stays uncovered here, so any orphan reported for
+        // *this specific file's own classes* would be a real drift signal.
+        // (The registry has many classes this one file's rules were never
+        // meant to cover -- e.g. Stripe/Gmail-only classes -- so this test
+        // only asserts about classes *this file itself* produces, not the
+        // full registry.)
+        let file = shipped_mapping_file("github.toml");
+        let catalogs = crate::composio::ComposioCatalogs::builtin()
+            .expect("shipped Composio catalogs must load");
+        let composio_classes: Vec<&str> = catalogs.action_classes().collect();
+
+        let findings = find_orphaned_action_classes(
+            &file,
+            composio_classes.iter().copied(),
+            &ActionClassRegistry::v0_1(),
+        );
+        for own_rule in &file.rules {
+            assert!(
+                !findings.iter().any(|f| f.class == own_rule.action_class),
+                "{} is produced by github.toml itself and must not be orphaned",
+                own_rule.action_class
+            );
         }
     }
 }

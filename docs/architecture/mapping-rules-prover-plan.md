@@ -57,8 +57,10 @@
   (this plan's checks use the registry's existing class list only, not
   `risk_level`), and `firma-run`'s local execution-governance `deny_actions`
   configuration — a separate subsystem (process/syscall governance, not HTTP
-  request classification) explicitly excluded from `INV-002` by user decision
-  after plan review (`DEC-006`, `PLAN-001`).
+  request classification), and an operator-authored config surface `INV-002`
+  has no access to and cannot enumerate, confirmed by user decision after
+  plan review as out of scope rather than something to load from a second
+  crate (`DEC-006`, `PLAN-001`).
 - Assumptions: the mapping-rule glob dialect stays exactly as documented today
   (`*` as the only wildcard, no character classes, no regex) — `DEC-002`'s
   algorithm depends on this and must be revisited if the dialect changes.
@@ -286,42 +288,60 @@
   obligation in `Risks and gaps` — a future `enrich_*` addition must update
   this list by hand.
 
-### `DEC-006`: `INV-002` covers the mapping-rules TOML and the Composio JSON catalog; the local execution-governance registry stays explicitly excluded — added after plan review (`PLAN-001`)
+### `DEC-006`: `INV-002` covers the mapping-rules TOML and the Composio JSON catalog; `firma-run`'s local execution-governance surface is out of scope, not excluded via a specific list — added after plan review (`PLAN-001`), refined during implementation
 
 - Choice: `find_orphaned_action_classes` checks a class as "producible" if it
-  appears in the merged `MappingRulesFile`, in any
-  `crates/firma-sidecar/config/composio/*.mapping.json` catalog, or in the
-  `DEC-005` dynamic-reclassification exemption list. Classes used only by
-  `firma-run`'s local seccomp/exec-gate `deny_actions` configuration
-  (`crates/firma-run/src/seccomp.rs`) are explicitly named as out of scope and
-  excluded from the "orphaned" check entirely — reported by neither an error
-  nor a warning, and not silently treated as covered either.
+  appears in the merged `MappingRulesFile`, in `ComposioCatalogs::builtin()`'s
+  entries (reusing the crate's existing loader — see below), or in the
+  `DEC-005` dynamic-reclassification exemption list. `firma-run`'s
+  `deny_actions` seccomp-policy surface is not loaded, inspected, or excluded
+  via any specific class list at all — it is simply outside what this check
+  reads, for reasons that make a specific exclusion list impossible, not
+  merely undesirable (see below).
 - Rationale and evidence: plan review (`PLAN-001`, confirmed independently —
   see `Plan-review findings and dispositions`) found `INV-002` as originally
   scoped would report roughly 20 of 52 registry classes as false-positive
-  "orphaned," because the Composio catalog (`composio/mod.rs:902-956`,
-  `action_for_tool` → `logical_envelope`) is a second, real producer of
+  "orphaned," because the Composio catalog (`composio/catalog.rs`,
+  `ComposioCatalogs::builtin()`, already a first-class, validated,
+  crate-exported type — `find_orphaned_action_classes` reuses it directly,
+  rather than re-parsing the underlying JSON) is a second, real producer of
   `ActionClassRegistry` classes that bypasses `MappingTable`/
   `IntentNormalizer::normalize` entirely — e.g. `calendar.read`,
   `communication.external.manage`, `credential.read` appear only in catalog
   JSON, never in any `mapping-rules.toml`. This is still squarely "the
   Sidecar's HTTP-intent-classification job," just via a second producer, so
   including it keeps `INV-002` honest without expanding its actual purpose.
-  `firma-run`'s local execution-governance use of the same string constants
-  (`system.execute`, `filesystem.delete`, etc., `seccomp.rs:747-832`) is a
-  different subsystem entirely — local process/syscall governance, not HTTP
-  request classification — confirmed by the user as out of scope for this
-  plan rather than folded in.
-- Consequences and rejected alternatives: rejected covering all three
-  producers (mapping-rules TOML, Composio catalog, and `firma-run`'s local
-  exec gate) — would pull a second crate and a structurally different
-  enforcement mechanism into this plan's scope, undermining "standalone,
-  orthogonal branch." Rejected leaving `INV-002` scoped to mapping-rules TOML
-  only with a static exemption list standing in for the Composio catalog —
-  would keep the check technically non-false-positive but silently give up
-  proving anything about ~20 real classes' actual reachability, which is a
-  materially weaker claim than "checked" while still calling itself
-  `check_registry_reachability`.
+  Implementation then found `firma-run`'s `deny_actions` is **not** a fixed,
+  code-level set of specific classes the way the Composio catalog is —
+  `crates/firma-run/src/config.rs`/`seccomp.rs`'s `deny_actions` is an
+  **operator-authored** list in a per-profile seccomp-policy TOML, accepting
+  any string from the same registry vocabulary, structurally identical in
+  openness to `mapping-rules.toml`'s own `action_class` field. There is no
+  fixed subset of registry classes to name and exclude — an operator could
+  reference any class there, and this check has no access to that
+  config surface at all (a different config file, a different crate, loaded
+  by `firma run`, not `firma-sidecar`). So "excluding firma-run's classes"
+  isn't a specific list this check consults; it is simply a config surface
+  this check never reads, confirmed by the user as out of scope for this
+  plan.
+- Consequences and rejected alternatives: rejected covering `firma-run`'s
+  `deny_actions` — impossible to do via a specific exclusion list (no such
+  fixed list exists to write) and out of scope to do via loading operator
+  seccomp-policy config from a different crate, which would pull a
+  structurally different enforcement mechanism into this plan, undermining
+  "standalone, orthogonal branch." Rejected leaving `INV-002` scoped to
+  mapping-rules TOML only with a static exemption list standing in for the
+  Composio catalog — would keep the check technically non-false-positive but
+  silently give up proving anything about ~20 real classes' actual
+  reachability, which is a materially weaker claim than "checked" while
+  still calling itself `check_registry_reachability`. **Accepted
+  consequence, disclosed rather than hidden:** a class governed exclusively
+  through an operator's own `deny_actions` config, with no mapping rule or
+  Composio catalog entry producing it, will still surface as an `INV-002`
+  warning — a real, known false-positive category from this check's narrow
+  vantage point, not a silent gap. Operators reading the report need to know
+  this to correctly disregard such a warning rather than treat it as
+  evidence of an unused registry class.
 
 ### `DEC-007`: Expose `load_mapping_rules` as `pub` from `firma-sidecar`; the `firma` CLI calls it directly — added after plan review (`PLAN-003`)
 
@@ -377,15 +397,16 @@
 
 ### `INV-002`: Every registry action class is producible by the Sidecar's HTTP-intent-classification paths
 
-- Semantic predicate (expanded after `PLAN-001`): for every class C in
-  `ActionClassRegistry`, at least one of the following holds: some merged
-  mapping rule's `action_class` field equals C; some entry in any
-  `crates/firma-sidecar/config/composio/*.mapping.json` catalog maps to C; or
-  C appears in the `DEC-005` dynamic-reclassification exemption list. Classes
-  used exclusively by `firma-run`'s local execution-governance
-  `deny_actions` configuration (a different subsystem, `DEC-006`) are
-  excluded from this predicate entirely — neither counted as covered nor
-  flagged as orphaned.
+- Semantic predicate (expanded after `PLAN-001`, refined during
+  implementation): for every class C in `ActionClassRegistry`, this check
+  reports a warning unless at least one of the following holds: some merged
+  mapping rule's `action_class` field equals C; some `ComposioCatalogs::
+  builtin()` entry maps to C; or C appears in the `DEC-005`
+  dynamic-reclassification exemption list. This predicate does not, and by
+  construction cannot, account for a class governed solely through an
+  operator's own `firma-run` `deny_actions` config (`DEC-006`) — such a class
+  will surface as a warning despite being in real, legitimate use elsewhere,
+  a disclosed limitation rather than a silent one.
 - Primary owner: the new `check_registry_reachability` function, consumed
   only by the `firma mapping-rules validate` CLI subcommand (`DEC-003`).
 - Detailed proof: `TRACE-002` (Technical evidence).
@@ -401,7 +422,13 @@
   workspace) with no external compatibility impact.
 - Durable documentation owner: this plan folds into
   `docs/architecture/sidecar-overview.md`'s mapping-rules description on
-  acceptance (cross-reference, not duplication).
+  acceptance (cross-reference, not duplication) — **done**: §5.1 now
+  cross-references a new docs-site guide,
+  `docs-site/src/content/docs/guides/validate-mapping-rules.md`
+  (registered in `docs-site/astro.config.mjs`'s sidebar and
+  `docs-site/public/llms.txt`), added post-implementation-review (see
+  `Post-implementation review` below) after the initial implementation
+  shipped without it.
 
 ## Implementation slices
 
@@ -449,9 +476,9 @@
   `check_registry_reachability(&MappingRulesFile, &[ComposioMappingCatalog],
   &ActionClassRegistry) -> Vec<OrphanedClassFinding>` (loading and parsing
   the shipped `config/composio/*.mapping.json` catalogs alongside the merged
-  `MappingRulesFile`), the `DEC-005` exemption constant, the `DEC-006`
-  excluded-class list for `firma-run`'s local execution-governance classes,
-  and the new `firma mapping-rules validate --config <path>` subcommand
+  `MappingRulesFile`), reusing `ComposioCatalogs::builtin()` (`DEC-006`) for
+  the Composio-catalog half rather than re-parsing its JSON, the `DEC-005`
+  exemption constant, and the new `firma mapping-rules validate --config <path>` subcommand
   (`crates/firma/src/args/mapping_rules.rs`, new) that calls the now-`pub`
   `load_mapping_rules` directly, runs Slice 1's check (reported as errors)
   and this slice's check (reported as warnings), and exits non-zero only if
@@ -471,8 +498,10 @@
 - Dependencies: Slice 1 (reuses its check function for the error half of the
   CLI's combined report) and `DEC-007`'s visibility change.
 - Intentionally unsupported: no static analysis of `enrich_*` functions
-  themselves — the exemption list is hand-maintained (`DEC-005`); no coverage
-  of `firma-run`'s local execution-governance classes (`DEC-006`).
+  themselves — the exemption list is hand-maintained (`DEC-005`); no
+  awareness of `firma-run`'s `deny_actions` config — a class governed solely
+  there is reported as an orphaned-class warning despite legitimate use, a
+  disclosed limitation, not a silent gap (`DEC-006`).
 
 ## Risks and gaps
 
@@ -691,6 +720,50 @@ throughout. Full-mode routing was independently confirmed as justified;
 Slice 1 was confirmed independently shippable; Slice 2's dependency on
 resolving `PLAN-003` is now recorded explicitly (`DEC-007`).
 
+## Post-implementation review
+
+Independent review of the actual implementation (`1a6b14e9`, `5b582a7e`,
+diffed against `8496b5d2`) — not the plan, which does not by itself prove
+correctness. Reviewer independently re-derived `find_shadowed_rule`'s
+soundness, verified the `HttpMethod`/8-variant grounding claim directly,
+loaded all four shipped `config/mappings/*.toml` files through
+`MappingTable::from_config` to confirm no silent breakage, ran clippy and
+the full mapping/CLI test selectors, and confirmed no `MappingTableError`
+exhaustive-match breakage exists workspace-wide. No critical or high
+findings; four low-severity findings, all corrected:
+
+- **Missing docs-site update**, contradicting `CLAUDE.md` and this plan's own
+  "Durable documentation owner" commitment. Corrected: added
+  `docs-site/src/content/docs/guides/validate-mapping-rules.md`, registered
+  in the sidebar and `llms.txt`, cross-referenced from
+  `sidecar-overview.md` §5.1.
+- **CLI's config extraction used `raw_section` + a second, independent
+  `toml::from_str` pass instead of the crate's typed `section::<T>()` entry
+  point** (`services::sidecar::read_config`'s own pattern) — narrowed the
+  "identical to Sidecar startup" claim `DEC-007` exists to establish, though
+  no bug was demonstrated. Corrected: `services/mapping_rules.rs` now uses
+  `resolved.config.section::<SidecarConfig>("sidecar")` directly.
+- **Plan promised a `build_pipeline_runtime`-level integration test; only a
+  `MappingTable::from_config`-level one shipped.** Corrected by amending the
+  plan (Slice 1, `TRACE-001`) to match what shipped and record why: no other
+  `MappingTableError` variant is tested at the higher level either, and
+  `build_pipeline_runtime` calls `from_config` directly with no intervening
+  logic.
+- **`find_shadowed_rule`'s doc comment overclaimed "the first shadowed
+  rule"** when multiple independent exact-tuple groups are each shadowed —
+  reviewer constructed a concrete counter-example (two groups, 18 rules)
+  proving the function returns _a_ shadowed position, not necessarily the
+  globally-earliest one, though soundness in both directions (never a false
+  accept, never a false reject) holds regardless. Corrected: doc comment
+  softened to state this precisely.
+
+No further independent review was sought after applying these corrections —
+per `adversarial-review`, a repeat review may be skipped when subsequent
+changes are purely mechanical and cannot affect behavior or meaning; all four
+corrections are either documentation, a call-path substitution to an
+existing, equivalent typed API, or comment wording, none changing observable
+behavior for any input the shipped tests exercise.
+
 ## Final verification
 
 - Focused checks: `cargo nextest run -p firma-sidecar -p firma` (mapping/CLI
@@ -716,12 +789,12 @@ resolving `PLAN-003` is now recorded explicitly (`DEC-007`).
 
 ### Conditional: Vocabulary
 
-| Canonical term                 | Meaning                                                                                                                                                                                                                                                         | Owner/context                            | Synonyms or terms to avoid                                                                                                                                                                                                                         | Conflict or decision |
-| ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------- |
-| Shadowed rule                  | A configured mapping rule whose pattern is fully subsumed by one or more higher-priority rules, so it can never match a real request                                                                                                                            | `MappingTable::from_config`              | "dead rule," "unreachable rule" (avoid — "shadowed" is used consistently in this plan)                                                                                                                                                             | `DEC-001`, `DEC-002` |
-| Orphaned action class          | A registry class with no static mapping rule, no Composio catalog entry, and no dynamic-reclassification exemption producing it — excludes classes used only by `firma-run`'s local execution-governance config, which this term deliberately does not describe | `check_registry_reachability`            | "unused class," "dead class" (avoid — "orphaned" distinguishes it from `risk_level`'s unrelated dead-code status)                                                                                                                                  | `DEC-005`, `DEC-006` |
-| Sensitivity                    | Deliberately NOT introduced by this plan — `risk_level` remains unconsumed metadata outside this checker's scope                                                                                                                                                | N/A                                      | Do not conflate with `INV-001`/`INV-002`, which don't consult `risk_level` at all                                                                                                                                                                  | Scope                |
-| `firma mapping-rules validate` | The new CLI subcommand this plan adds                                                                                                                                                                                                                           | `crates/firma/src/args/mapping_rules.rs` | Avoid confusing with `firma config --mapping` (selects a built-in mapping _template_ to scaffold) or `firma policy list`'s "Mappings" section — same word, different concept, collision confirmed and resolved by renaming (`DEC-004`, `PLAN-004`) | `DEC-004`            |
+| Canonical term                 | Meaning                                                                                                                                                                                                                                                                                                                           | Owner/context                            | Synonyms or terms to avoid                                                                                                                                                                                                                         | Conflict or decision |
+| ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------- |
+| Shadowed rule                  | A configured mapping rule whose pattern is fully subsumed by one or more higher-priority rules, so it can never match a real request                                                                                                                                                                                              | `MappingTable::from_config`              | "dead rule," "unreachable rule" (avoid — "shadowed" is used consistently in this plan)                                                                                                                                                             | `DEC-001`, `DEC-002` |
+| Orphaned action class          | A registry class with no static mapping rule, no Composio catalog entry, and no dynamic-reclassification exemption producing it — this check has no visibility into `firma-run`'s `deny_actions` config, so a class governed solely there is still reported as "orphaned" (a disclosed, known false-positive category, `DEC-006`) | `check_registry_reachability`            | "unused class," "dead class" (avoid — "orphaned" distinguishes it from `risk_level`'s unrelated dead-code status)                                                                                                                                  | `DEC-005`, `DEC-006` |
+| Sensitivity                    | Deliberately NOT introduced by this plan — `risk_level` remains unconsumed metadata outside this checker's scope                                                                                                                                                                                                                  | N/A                                      | Do not conflate with `INV-001`/`INV-002`, which don't consult `risk_level` at all                                                                                                                                                                  | Scope                |
+| `firma mapping-rules validate` | The new CLI subcommand this plan adds                                                                                                                                                                                                                                                                                             | `crates/firma/src/args/mapping_rules.rs` | Avoid confusing with `firma config --mapping` (selects a built-in mapping _template_ to scaffold) or `firma policy list`'s "Mappings" section — same word, different concept, collision confirmed and resolved by renaming (`DEC-004`, `PLAN-004`) | `DEC-004`            |
 
 ### Conditional: Alternatives
 
@@ -737,15 +810,20 @@ rejection rationale in the human review path; not repeated here.
 
 ```diff
  crates/firma-sidecar/src/normalizer/
-+├── mapping_prover.rs        # NEW — INV-001/INV-002 check functions, MappingFinding types
-~├── mapping.rs               # MODIFIED — from_config calls the new shadowing check; new MappingTableError variant
+~├── mapping.rs               # MODIFIED — INV-001 (Slice 1, landed) and INV-002 (Slice 2)
+                               #   check functions co-located here, not a separate module: both
+                               #   need private access to MappingRule/MappingTable internals;
+                               #   new MappingTableError variant landed in Slice 1
+ crates/firma-sidecar/src/composio/
+~├── catalog.rs               # MODIFIED — ComposioCatalogs gains an `action_classes()` iterator
  crates/firma-sidecar/src/startup/
 ~├── pipeline.rs              # MODIFIED — `load_mapping_rules` becomes `pub` (DEC-007)
  crates/firma/src/args/
 +├── mapping_rules.rs         # NEW — `firma mapping-rules validate` subcommand args
 ~├── mod.rs                   # MODIFIED — registers the new `mapping-rules` top-level command
  crates/firma/src/services/
-+├── mapping_rules.rs         # NEW — `firma mapping-rules validate` implementation, reuses mapping_prover + Composio catalog loading
++├── mapping_rules.rs         # NEW — `firma mapping-rules validate` implementation, reuses
+                               #   firma_sidecar's mapping.rs checks + ComposioCatalogs::builtin()
  crates/firma/tests/integration/
 +├── mapping_rules_validate.rs # NEW — CLI black-box tests
  crates/firma-sidecar/tests/integration/
@@ -791,7 +869,7 @@ pub struct ComposioMappingCatalog {/* .. */}
 /// Returns every INV-002 violation — classes in `registry` that neither
 /// `rules` nor any `catalogs` entry produces and that aren't in the DEC-005
 /// exemption list. Classes exclusively used by firma-run's local
-/// execution-governance configuration (DEC-006) are excluded from
+/// execution-governance configuration cannot be, by construction (DEC-006) —
 /// `registry` iteration entirely before this check runs, not flagged by it.
 /// Called only from the `firma mapping-rules validate` CLI path.
 pub fn find_orphaned_action_classes(
@@ -819,21 +897,21 @@ pub fn find_orphaned_action_classes(
 | Proof boundary             | Unit (algorithm) + integration (`MappingTable::from_config`)                                                                                                                                                               |
 | Unknowns                   | Whether an operator override is wanted (`Scope`'s open decision)                                                                                                                                                           |
 
-| Field                      | Content                                                                                                                                                                                                                                                                                                                  |
-| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Trace ID                   | `TRACE-002`                                                                                                                                                                                                                                                                                                              |
-| State                      | Proposed                                                                                                                                                                                                                                                                                                                 |
-| Entry and stimulus         | Operator runs `firma mapping-rules validate --config <firma.toml>`                                                                                                                                                                                                                                                       |
-| Path                       | `firma mapping-rules validate → firma_sidecar::load_mapping_rules (now pub, DEC-007) → MappingTable::from_config (INV-001, as errors) → find_orphaned_action_classes(rules, composio_catalogs, registry) (INV-002, as warnings) → render report → exit 0 if no errors, 1 if any error (warnings never affect exit code)` |
-| Input/output types         | `PathBuf (config) → Vec<MappingFinding> → process exit code`                                                                                                                                                                                                                                                             |
-| Validation/trust crossings | None — offline tool, operator-invoked, same trust level as `firma policy validate`                                                                                                                                                                                                                                       |
-| Invariant established      | `INV-002` (advisory)                                                                                                                                                                                                                                                                                                     |
-| Invariant assumed          | None downstream                                                                                                                                                                                                                                                                                                          |
-| Success outcome            | Report printed; exit 0 if no `INV-001` violations (warnings may still be present)                                                                                                                                                                                                                                        |
-| Failure path               | Exit 1 if any `INV-001` violation; warnings are always non-fatal                                                                                                                                                                                                                                                         |
-| Evidence                   | New CLI black-box integration test                                                                                                                                                                                                                                                                                       |
-| Proof boundary             | CLI integration test                                                                                                                                                                                                                                                                                                     |
-| Unknowns                   | None material                                                                                                                                                                                                                                                                                                            |
+| Field                      | Content                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Trace ID                   | `TRACE-002`                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| State                      | Landed (Slice 2, `5b582a7e`; config-extraction corrected post-review to `resolved.config.section::<SidecarConfig>("sidecar")`, matching `services::sidecar::read_config` exactly, not a second `raw_section`+`toml::from_str` path)                                                                                                                                                                                            |
+| Entry and stimulus         | Operator runs `firma mapping-rules validate --config <firma.toml>`                                                                                                                                                                                                                                                                                                                                                             |
+| Path                       | `firma mapping-rules validate → resolved.config.section::<SidecarConfig>("sidecar") → SidecarConfig::try_from → rebase_defaults → firma_sidecar::load_mapping_rules (pub, DEC-007) → MappingTable::from_config (INV-001, as errors) → find_orphaned_action_classes(rules, catalogs.action_classes(), registry) (INV-002, as warnings) → render report → exit 0 if no errors, 1 if any error (warnings never affect exit code)` |
+| Input/output types         | `PathBuf (config) → Vec<MappingFinding> → process exit code`                                                                                                                                                                                                                                                                                                                                                                   |
+| Validation/trust crossings | None — offline tool, operator-invoked, same trust level as `firma policy validate`                                                                                                                                                                                                                                                                                                                                             |
+| Invariant established      | `INV-002` (advisory)                                                                                                                                                                                                                                                                                                                                                                                                           |
+| Invariant assumed          | None downstream                                                                                                                                                                                                                                                                                                                                                                                                                |
+| Success outcome            | Report printed; exit 0 if no `INV-001` violations (warnings may still be present)                                                                                                                                                                                                                                                                                                                                              |
+| Failure path               | Exit 1 if any `INV-001` violation; warnings are always non-fatal                                                                                                                                                                                                                                                                                                                                                               |
+| Evidence                   | New CLI black-box integration test                                                                                                                                                                                                                                                                                                                                                                                             |
+| Proof boundary             | CLI integration test                                                                                                                                                                                                                                                                                                                                                                                                           |
+| Unknowns                   | None material                                                                                                                                                                                                                                                                                                                                                                                                                  |
 
 ### Conditional: Trust analysis
 
@@ -873,17 +951,17 @@ pub fn find_orphaned_action_classes(
 | Slice                  | 1                                                                                                                                                                                                                                                                                                                                                                                      |
 | Limits                 | Proves method-reachability only within exact `(host_pattern, path_pattern)`-equality groups (`DEC-002`) — proves nothing about shadowing across two rules with different patterns, regardless of glob-subset relationship; grounds the method universe in `HttpMethod`'s 8 closed variants, not the full open `http::Method` space; does not prove anything about Cedar-level outcomes |
 
-| Field                  | Content                                                                                                                                                                                                                                  |
-| ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Invariant              | `INV-002`                                                                                                                                                                                                                                |
-| Kind                   | Operational                                                                                                                                                                                                                              |
-| Owner/proof boundary   | `find_orphaned_action_classes`, consumed by `firma mapping-rules validate`                                                                                                                                                               |
-| Suite/boundary         | Unit + CLI integration                                                                                                                                                                                                                   |
-| Stimulus               | A registry class absent from the merged rule set, every Composio catalog, and the exemption list                                                                                                                                         |
-| Observable effects     | A warning line in the CLI report; exit code unaffected                                                                                                                                                                                   |
-| Controls/substitutions | Real shipped `config/mappings/*.toml` and `config/composio/*.mapping.json` files used directly in unit tests                                                                                                                             |
-| Failure cases          | An exemption-list omission causing a permanent false-positive warning for a legitimately dynamic-only class; a Composio catalog update this check isn't re-run against                                                                   |
-| Evidence               | New tests, Slice 2                                                                                                                                                                                                                       |
-| Status                 | Planned                                                                                                                                                                                                                                  |
-| Slice                  | 2                                                                                                                                                                                                                                        |
-| Limits                 | Advisory only — does not block startup or deployment; does not verify `enrich_*` functions themselves; does not cover `firma-run`'s local execution-governance classes (`DEC-006`, explicitly excluded, not silently treated as covered) |
+| Field                  | Content                                                                                                                                                                                                                                                                                                                                      |
+| ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Invariant              | `INV-002`                                                                                                                                                                                                                                                                                                                                    |
+| Kind                   | Operational                                                                                                                                                                                                                                                                                                                                  |
+| Owner/proof boundary   | `find_orphaned_action_classes`, consumed by `firma mapping-rules validate`                                                                                                                                                                                                                                                                   |
+| Suite/boundary         | Unit + CLI integration                                                                                                                                                                                                                                                                                                                       |
+| Stimulus               | A registry class absent from the merged rule set, every Composio catalog, and the exemption list                                                                                                                                                                                                                                             |
+| Observable effects     | A warning line in the CLI report; exit code unaffected                                                                                                                                                                                                                                                                                       |
+| Controls/substitutions | Real shipped `config/mappings/*.toml` and `config/composio/*.mapping.json` files used directly in unit tests                                                                                                                                                                                                                                 |
+| Failure cases          | An exemption-list omission causing a permanent false-positive warning for a legitimately dynamic-only class; a Composio catalog update this check isn't re-run against                                                                                                                                                                       |
+| Evidence               | New tests, Slice 2                                                                                                                                                                                                                                                                                                                           |
+| Status                 | Planned                                                                                                                                                                                                                                                                                                                                      |
+| Slice                  | 2                                                                                                                                                                                                                                                                                                                                            |
+| Limits                 | Advisory only — does not block startup or deployment; does not verify `enrich_*` functions themselves; a class governed solely via `firma-run`'s `deny_actions` config surfaces as a warning despite legitimate use, since this check has no visibility into that config surface at all (`DEC-006`, disclosed, not silently assumed covered) |

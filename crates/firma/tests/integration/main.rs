@@ -12,6 +12,7 @@ mod config_selection;
 mod doctor;
 mod e2e_startup;
 mod firma_config;
+mod mapping_rules_cli;
 mod monitor_audit_stream;
 mod monitor_decoupled;
 mod policy_cli;

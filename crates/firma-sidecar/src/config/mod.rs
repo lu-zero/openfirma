@@ -239,6 +239,17 @@ impl SidecarConfig {
         Ok(())
     }
 
+    /// Whether an unmatched request on a protected host denies as
+    /// unclassified (`true`, the default) or passes through unenforced.
+    /// Exposed so `firma mapping-rules validate` can call
+    /// [`crate::normalizer::MappingTable::from_config`] the same way
+    /// Sidecar startup does, without needing `enforcement` itself to be
+    /// public.
+    #[must_use]
+    pub fn mapping_default_protected(&self) -> bool {
+        self.enforcement.mapping.default_protected
+    }
+
     /// Re-base every relative resource path against `config_dir`;
     /// absolute paths are left untouched. No default-name sentinel
     /// check — relative always means "relative to the config file's

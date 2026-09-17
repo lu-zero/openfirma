@@ -105,6 +105,16 @@ impl ComposioCatalogs {
         self.entries.get(slug)
     }
 
+    /// Iterate the distinct action classes this catalog set maps any tool
+    /// slug to — a second, real producer of `ActionClassRegistry` classes
+    /// alongside `MappingTable`, consulted by the mapping-rules prover's
+    /// `INV-002` check (`docs/architecture/mapping-rules-prover-plan.md`).
+    pub fn action_classes(&self) -> impl Iterator<Item = &str> {
+        self.entries
+            .values()
+            .map(|entry| entry.action_class.as_str())
+    }
+
     /// Return the number of reviewed tools.
     #[must_use]
     pub fn len(&self) -> usize {
