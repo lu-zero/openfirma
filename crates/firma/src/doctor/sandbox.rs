@@ -15,6 +15,9 @@ use crate::doctor::report::Check;
 pub enum Backend {
     /// Linux bubblewrap isolation.
     Bwrap,
+    /// Linux namespaces + Landlock + seccomp via the embedded `hakoniwa`
+    /// library — experimental, opt-in only (`docs/architecture/hakoniwa-backend-plan.md`).
+    Hakoniwa,
     /// macOS Virtualization framework.
     Vz,
     /// Windows Subsystem for Linux 2.
@@ -28,12 +31,21 @@ impl Backend {
     fn label(self) -> &'static str {
         match self {
             Self::Bwrap => "sandbox bwrap",
+            Self::Hakoniwa => "sandbox hakoniwa",
             Self::Vz => "sandbox vz",
             Self::Wsl2 => "sandbox wsl2",
             Self::Firecracker => "sandbox firecracker",
         }
     }
 }
+
+/// Environment variable naming the `firma-hakoniwa-runner` binary to spawn.
+/// Mirrors `firma_run::backend::hakoniwa`'s own (private) constant of the
+/// same name — duplicated rather than exported, matching this workspace's
+/// established convention for small, stable cross-crate string constants
+/// (e.g. the DNS-stub wire-format tags) — kept in sync by this cross-
+/// reference comment, not shared code.
+const HAKONIWA_RUNNER_ENV: &str = "FIRMA_RUN_HAKONIWA_RUNNER";
 
 /// Current OS family — `linux`, `macos`, or `windows`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,6 +139,12 @@ pub struct HostProbe {
     /// sentence (e.g. naming an `AppArmor` policy) when only a functional probe
     /// detected the restriction — never assume it's always a path.
     pub userns_restricted: Option<String>,
+    /// Raw value of `FIRMA_RUN_HAKONIWA_RUNNER`, if set. Captured here rather
+    /// than read live inside `check_hakoniwa` so the doctor's env dependency
+    /// is snapshotted once, in one place, like `wsl` and `userns_restricted`
+    /// — keeps the check itself a pure function of `HostProbe`, testable
+    /// without mutating process-global env state.
+    pub hakoniwa_runner_env: Option<String>,
 }
 
 impl HostProbe {
@@ -137,11 +155,12 @@ impl HostProbe {
             os: OsFamily::current(),
             wsl: firma_run::backend::platform::detect_wsl().is_wsl(),
             userns_restricted: firma_run::backend::platform::userns_restricted(),
+            hakoniwa_runner_env: std::env::var(HAKONIWA_RUNNER_ENV).ok(),
         }
     }
 }
 
-/// Build the four-element check vector for `host` using `prober`.
+/// Build the five-element check vector for `host` using `prober`.
 ///
 /// Verdicts mirror what `firma run` would do on this host (see
 /// `firma_run::config::resolve_backend` and the bwrap preflight): the backend
@@ -149,9 +168,10 @@ impl HostProbe {
 /// runtime would refuse here do not report `OK`, and backends that simply do
 /// not apply to this host report `WARN` (informational, never `OK`).
 pub async fn check_with(host: &HostProbe, prober: &dyn Prober) -> Vec<Check> {
-    let mut out = Vec::with_capacity(4);
+    let mut out = Vec::with_capacity(5);
     for backend in [
         Backend::Bwrap,
+        Backend::Hakoniwa,
         Backend::Vz,
         Backend::Wsl2,
         Backend::Firecracker,
@@ -167,6 +187,13 @@ async fn check_backend(backend: Backend, host: &HostProbe, prober: &dyn Prober) 
     match (backend, host.os) {
         // -- Linux ----------------------------------------------------------
         (Backend::Bwrap, OsFamily::Linux) => check_bwrap(label, host, prober).await,
+        // Never the runtime's own auto-selected default (opt-in only, per
+        // `docs/architecture/hakoniwa-backend-plan.md`'s own "never a
+        // platform default" framing) — reported the same way Firecracker
+        // is: informational, not a FAIL, when its own preflight would
+        // refuse it, since an operator who never asked for it should not
+        // see a red X for a backend they're not using.
+        (Backend::Hakoniwa, OsFamily::Linux) => check_hakoniwa(label, host),
         (Backend::Wsl2, OsFamily::Linux) => {
             if host.wsl {
                 // The runtime auto-selects wsl2 here; reflect it as usable
@@ -221,6 +248,59 @@ async fn check_bwrap(label: &'static str, host: &HostProbe, prober: &dyn Prober)
         );
     }
     probe_to_check(label, Backend::Bwrap, prober).await
+}
+
+/// hakoniwa verdict on Linux, matching `hakoniwa::preflight_host_support`
+/// (same two checks, same reasoning — see that function's own doc comment
+/// for why a WSL check exists at all).
+///
+/// Deliberately not a `Prober`/CLI-shaped check the way `check_bwrap`'s
+/// final step is: `hakoniwa` is an embedded library reached through a
+/// sibling binary (`firma-hakoniwa-runner`), not a `$PATH`-resolved
+/// external tool with a meaningful `--version` — the real capability
+/// question is the same kernel unprivileged-userns check `HostProbe`
+/// already computes for bwrap, reused here (`docs/architecture/hakoniwa-backend-plan.md`,
+/// Slice 6). A restricted host still reports `WARN`, not `FAIL`, matching
+/// `Backend::Hakoniwa`'s own "opt-in only, never the runtime's default"
+/// status — an operator who isn't using this backend should not see a red
+/// X for it.
+fn check_hakoniwa(label: &'static str, host: &HostProbe) -> Check {
+    if host.wsl {
+        return Check::warn(
+            label,
+            "not usable under WSL: unprivileged user namespaces unavailable",
+        );
+    }
+    if let Some(restriction) = &host.userns_restricted {
+        let detail = if restriction.starts_with('/') {
+            format!("{restriction}=0")
+        } else {
+            restriction.clone()
+        };
+        return Check::warn(
+            label,
+            format!(
+                "user namespace creation restricted ({detail}); hakoniwa cannot construct a \
+                 sandbox until this is enabled"
+            ),
+        );
+    }
+    match &host.hakoniwa_runner_env {
+        Some(path) if std::path::Path::new(path).is_file() => {
+            Check::ok(label, format!("runner configured at {path}")).with_detail("runner", path)
+        }
+        Some(path) => Check::warn(
+            label,
+            format!("{HAKONIWA_RUNNER_ENV} does not point to a file: {path}"),
+        ),
+        None => Check::warn(
+            label,
+            format!(
+                "kernel capability available, but {HAKONIWA_RUNNER_ENV} is not set — opt-in \
+                 backend, not configured on this host"
+            ),
+        ),
+    }
 }
 
 /// Run the CLI probe for `backend` and map the outcome to a `Check`. A failed
@@ -336,6 +416,12 @@ impl Prober for CommandProber {
                 Backend::Vz => ProbeOutcome {
                     result: Err("vz has no command-line probe".into()),
                 },
+                Backend::Hakoniwa => ProbeOutcome {
+                    result: Err(
+                        "hakoniwa is an embedded library, not a $PATH command; use check_hakoniwa"
+                            .into(),
+                    ),
+                },
             }
         })
     }
@@ -364,6 +450,7 @@ mod tests {
             os,
             wsl: false,
             userns_restricted: None,
+            hakoniwa_runner_env: None,
         }
     }
 
@@ -377,12 +464,17 @@ mod tests {
         m.insert(Backend::Bwrap, outcome_ok("bubblewrap 0.8.0"));
         m.insert(Backend::Firecracker, outcome_ok("Firecracker v1.7.0"));
         let checks = check_with(&host(OsFamily::Linux), &MockProber::new(m)).await;
-        assert_eq!(checks.len(), 4);
+        assert_eq!(checks.len(), 5);
         let by_label = by_label(&checks);
         assert_eq!(by_label["sandbox bwrap"].status, Status::Ok);
         assert_eq!(by_label["sandbox firecracker"].status, Status::Ok);
         assert_eq!(by_label["sandbox vz"].status, Status::Warn);
         assert_eq!(by_label["sandbox wsl2"].status, Status::Warn);
+        // hakoniwa's own verdict does not depend on the mocked CLI prober at
+        // all (it has no `--version` probe); its status here just reflects
+        // whether FIRMA_RUN_HAKONIWA_RUNNER happens to be set in the test
+        // process's own environment, so only assert the check is present.
+        assert!(by_label.contains_key("sandbox hakoniwa"));
         // wsl2 is not selected on native Linux, but it is not "unsupported";
         // the message must not claim so (runtime selects bwrap here).
         assert!(
@@ -447,6 +539,7 @@ mod tests {
             os: OsFamily::Linux,
             wsl: true,
             userns_restricted: None,
+            hakoniwa_runner_env: None,
         };
         let checks = check_with(&probe, &MockProber::new(m)).await;
         let by_label = by_label(&checks);
@@ -465,6 +558,23 @@ mod tests {
                 .contains("wsl"),
             "got {}",
             by_label["sandbox bwrap"].reason
+        );
+
+        // hakoniwa needs the same unprivileged-userns primitive bwrap does,
+        // so it must be refused under WSL too (not OK, reason names WSL).
+        assert_ne!(
+            by_label["sandbox hakoniwa"].status,
+            Status::Ok,
+            "hakoniwa must not be OK on WSL: {}",
+            by_label["sandbox hakoniwa"].reason
+        );
+        assert!(
+            by_label["sandbox hakoniwa"]
+                .reason
+                .to_lowercase()
+                .contains("wsl"),
+            "got {}",
+            by_label["sandbox hakoniwa"].reason
         );
 
         // wsl2 is the selected backend here: not OK-blocked, not "unsupported".
@@ -486,6 +596,7 @@ mod tests {
             os: OsFamily::Linux,
             wsl: false,
             userns_restricted: Some("/proc/sys/user/max_user_namespaces".to_owned()),
+            hakoniwa_runner_env: None,
         };
         let checks = check_with(&probe, &MockProber::new(m)).await;
         let bwrap = checks
@@ -498,6 +609,85 @@ mod tests {
             "got {}",
             bwrap.reason
         );
+
+        // hakoniwa is opt-in only (never the runtime's own default), so the
+        // same userns restriction reports WARN here, not FAIL, unlike bwrap.
+        let hakoniwa = checks
+            .iter()
+            .find(|c| c.category == "sandbox hakoniwa")
+            .expect("hakoniwa check");
+        assert_eq!(hakoniwa.status, Status::Warn);
+        assert!(
+            hakoniwa.reason.contains("max_user_namespaces"),
+            "got {}",
+            hakoniwa.reason
+        );
+    }
+
+    #[test]
+    fn check_hakoniwa_wsl_is_warn() {
+        let probe = HostProbe {
+            os: OsFamily::Linux,
+            wsl: true,
+            userns_restricted: None,
+            hakoniwa_runner_env: None,
+        };
+        let check = check_hakoniwa("sandbox hakoniwa", &probe);
+        assert_eq!(check.status, Status::Warn);
+        assert!(
+            check.reason.to_lowercase().contains("wsl"),
+            "got {}",
+            check.reason
+        );
+    }
+
+    #[test]
+    fn check_hakoniwa_runner_missing_is_warn() {
+        let probe = HostProbe {
+            os: OsFamily::Linux,
+            wsl: false,
+            userns_restricted: None,
+            hakoniwa_runner_env: None,
+        };
+        let check = check_hakoniwa("sandbox hakoniwa", &probe);
+        assert_eq!(check.status, Status::Warn);
+        assert!(
+            check.reason.contains(HAKONIWA_RUNNER_ENV),
+            "got {}",
+            check.reason
+        );
+    }
+
+    #[test]
+    fn check_hakoniwa_runner_path_not_a_file_is_warn() {
+        let probe = HostProbe {
+            os: OsFamily::Linux,
+            wsl: false,
+            userns_restricted: None,
+            hakoniwa_runner_env: Some("/nonexistent/firma-hakoniwa-runner".to_owned()),
+        };
+        let check = check_hakoniwa("sandbox hakoniwa", &probe);
+        assert_eq!(check.status, Status::Warn);
+        assert!(
+            check.reason.contains("does not point to a file"),
+            "got {}",
+            check.reason
+        );
+    }
+
+    #[test]
+    fn check_hakoniwa_runner_file_present_is_ok() {
+        let runner = tempfile::NamedTempFile::new().expect("tempfile");
+        let path = runner.path().to_string_lossy().into_owned();
+        let probe = HostProbe {
+            os: OsFamily::Linux,
+            wsl: false,
+            userns_restricted: None,
+            hakoniwa_runner_env: Some(path.clone()),
+        };
+        let check = check_hakoniwa("sandbox hakoniwa", &probe);
+        assert_eq!(check.status, Status::Ok);
+        assert!(check.reason.contains(&path), "got {}", check.reason);
     }
 
     #[test]

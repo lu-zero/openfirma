@@ -401,7 +401,10 @@ fn create_hakoniwa_runtime_dir(sandbox_id: &SandboxId) -> Result<PathBuf, RunErr
 /// Launch payload handed to `firma-hakoniwa-runner`.
 ///
 /// Must stay in sync with `firma-hakoniwa-runner`'s own `LaunchContract`.
-/// Still no identity-mode support — that lands in Slice 4/2.
+/// Still no identity-mode support (`BwrapBackend`'s sandbox-user remap,
+/// passwd/group mounts) — unlike signal-forwarding (Slice 4) and mount-plan
+/// translation (Slice 2), both now implemented without adding it, this is a
+/// genuinely open, not-yet-scoped-into-any-slice gap, not upcoming work.
 #[derive(Debug, Serialize)]
 struct HakoniwaLaunchContract {
     version: u32,

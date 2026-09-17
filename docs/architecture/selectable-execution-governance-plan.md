@@ -233,14 +233,37 @@ the exposure window but does not eliminate it.
 
 #### Slice 4 implementation findings
 
-Not started for `PtraceSeccompExec`'s own benchmark numbers yet (Slice 2
-doesn't exist yet, so full three-way parametrization is not yet possible
-either). `openfirma-notes/bench/` already has a reproducible-on-demand
-harness and methodology (`run-benchmarks.sh`, `RESULTS.md`) comparing
-`MicrovmBackend`/`HakoniwaBackend`; extending it with a third,
-`PtraceSeccompExec`-specific measurement (per-`exec()` overhead, since
-this mechanism only traps `execve`/`execveat`, not every syscall) is
-pending follow-up work using that same methodology.
+**Benchmark half: done, in a later session; this section was stale.**
+`openfirma-notes/bench/run-ptrace-benchmark.sh` extends the same
+methodology `run-benchmarks.sh` established, with a `PtraceSeccompExec`-
+specific measurement (per-`exec()` overhead, since this mechanism only
+traps `execve`/`execveat`, not every syscall). Real, reproducible numbers
+exist in `RESULTS.md`'s "`PtraceSeccompExec` execution-governance overhead"
+section for all four `{bwrap, hakoniwa} × {inherited, ptrace_seccomp_exec}`
+combinations — both steady-state per-exec cost (2,000 repeated execs) and
+one-time cold-start cost. Headline finding: `ptrace_seccomp_exec` adds the
+same ~+29% regardless of backend (~640μs/exec either way), and Landlock's
+own native descendant-exec enforcement (`hakoniwa` + `inherited`) is
+statistically free (−2.1%, noise) — the clearest evidence in this
+comparison that Landlock, where available, is the architecturally cheaper
+mechanism for this specific property; `ptrace_seccomp_exec`'s real value is
+as a fallback where Landlock is unavailable, not an addition on top of it.
+
+**Validation half: real for Hakoniwa specifically, but not the parametrized
+table this slice's own "Production" bullet asked for.**
+`tests/e2e/scenarios/hakoniwa_backend.rs::hakoniwa_backend_denies_forbidden_tool_via_ptrace_seccomp_exec`
+proves `ptrace_seccomp_exec` correctly denies a descendant-process exec
+under `HakoniwaBackend` specifically — real coverage, not a gap for that
+one question. What remains genuinely unstarted:
+`tests/e2e/scenarios/child_process_governance/execution.rs` is still a
+single, fixed-config (`Inherited`-only, backend-unspecified) "red control"
+test proving the FIR-366 problem exists, not a table-driven suite
+parametrized across `{Inherited, LandlockExecute, PtraceSeccompExec} ×
+{Bwrap, Hakoniwa}` the way this slice's own text describes. `LandlockExecute`
+(Slice 2) also still does not exist as a selectable strategy in its own
+right, separate from `HakoniwaBackend`'s own always-on Landlock use — so
+full three-way parametrization remains blocked on that, independent of the
+benchmark/single-backend-validation work above being done.
 
 ## Risks and gaps
 
