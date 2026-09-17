@@ -667,6 +667,85 @@
   (harmless redundancy) without deciding whether it _should remain_
   redundant going forward.
 
+### `DEC-021`: Resolve `DEC-020`'s open question — a Landlock-support probe, not a widened grant
+
+- Choice: `firma-hakoniwa-runner` now probes the host kernel's actual
+  Landlock support before deciding whether to build and install a Landlock
+  ruleset at all. When unsupported, the ruleset is skipped entirely
+  (`Container::landlock_ruleset` is simply never called) — but only when
+  `LaunchContract::landlock_optional` is `true`, which `firma-run` sets
+  exactly when a non-`Inherited` `execution_governance` strategy is active
+  (the same predicate `DEC-020` already uses to decide whether the
+  strategy's own rewritten launch target needs adding to the Landlock
+  allow-list). Under the default `Inherited` strategy, `landlock_optional`
+  stays `false`, so an unsupported kernel still hard-fails the whole
+  sandbox launch exactly as before — Landlock is the _only_ enforcement of
+  `allowed_executables` in that case, so this preserves fail-closed
+  behavior unchanged.
+- Rejected first approach (implemented, then reverted, never previously
+  written to this plan): widen `LANDLOCK_READ_ONLY_DIRS`'s grant from `R`
+  to `R | X` whenever `execution_governance != Inherited`, so Landlock
+  would "defer" to ptrace for anything ptrace decides on. Implemented,
+  passed its own new test, then proven completely inert by a deliberate
+  empirical sanity check: forcing the old, non-widened behavior back on
+  produced an identical test result. Root cause: `PtraceSeccompExec`'s
+  deny mechanism (`DEC-015`) rewrites the syscall number to an invalid
+  value before continuing, so the kernel never dispatches the real
+  `execve`/`execveat` at all for anything ptrace denies — Landlock's LSM
+  hook only runs _inside_ execve's own kernel implementation, so it is
+  never even reached in the denied case; and anything ptrace _allows_ is,
+  by construction, already a member of `allowed_executables`, which
+  Landlock's own unwidened per-executable grant already covers. Widening
+  the grant changed nothing observable in either direction. Fully reverted
+  (`git checkout --` on all three touched files) before this decision.
+- Rationale and evidence for the probe technique: the `landlock` crate
+  (v0.4.5) deliberately does not expose a public "detect current kernel
+  ABI" API — its own doc comment states ABI "should not be dynamically
+  created (in other crates) according to the running kernel, to avoid
+  inconsistent behaviors and non-determinism" — but its own internal,
+  private `LandlockStatus::current()` demonstrates the correct raw-syscall
+  technique: `landlock_create_ruleset(NULL, 0,
+  LANDLOCK_CREATE_RULESET_VERSION)`, a form the kernel documents as
+  returning the highest supported ABI version (not an fd — nothing to
+  close) when supported, or a negative `errno`
+  (`ENOSYS`/`EOPNOTSUPP`) otherwise. `libc::SYS_landlock_create_ruleset`
+  (`444`) and `LANDLOCK_CREATE_RULESET_VERSION` (`1`) are confirmed
+  identical across both `x86_64` and `aarch64` in `libc` 0.2's own per-arch
+  tables — unlike `DEC-018`'s ptrace register work, this probe's
+  correctness does not depend on this session's aarch64-only host, so it
+  is not gated to confirmed architectures the way `ptrace_seccomp_exec`
+  itself is. Empirically verified end-to-end on this host: a standalone
+  program issuing the exact same syscall reports `supported = true` (ABI
+  8) unfiltered, and `supported = false` under `strace -e
+  inject=landlock_create_ruleset:error=ENOSYS` fault injection — proving
+  the probe's decision logic flips correctly under a simulated
+  unsupported-kernel condition, without needing an actual old kernel.
+- Consequences: `HakoniwaBackend`'s `LAUNCH_CONTRACT_VERSION` bumped 4→5
+  (new `landlock_optional: bool` field on both `HakoniwaLaunchContract` and
+  `firma-hakoniwa-runner`'s `LaunchContract`). `PtraceSeccompExec` is now a
+  genuine, non-redundant fallback on a kernel too old for Landlock: the
+  sandbox launches (rather than hard-failing) and ptrace enforces the exec
+  allow-list on its own — but Landlock's broader FS read/write confinement
+  (not just the exec allow-list) is then entirely absent on such a host,
+  which `firma-hakoniwa-runner` reports via an `eprintln!` at launch time.
+  This is a real, intentional narrowing of enforcement scope on old
+  kernels, not a cosmetic change — operators relying on Landlock's FS
+  confinement specifically (not just the exec gate) on a kernel without
+  Landlock support have no fallback for that part today.
+- Gap not resolved by this decision: the unsupported-kernel branches
+  (`landlock_optional` true or false, kernel unsupported) are not covered
+  by an automated regression test in this repository — doing so would
+  need either an actual pre-5.13 kernel, a test-only visibility change to
+  `firma-hakoniwa-runner` (a `[[bin]]`-only crate with no `lib` target, so
+  an integration test cannot otherwise reach its private functions), or a
+  novel `strace`-based e2e test (an external-tool dependency this test
+  suite does not otherwise take on). The decision-relevant boolean logic
+  itself (`landlock_supported || !landlock_optional`) is a one-line
+  expression already exercised on its two "supported" rows by the existing
+  `hakoniwa_backend_restricts_descendant_exec_via_landlock` (`Inherited`)
+  and `hakoniwa_backend_denies_forbidden_tool_via_ptrace_seccomp_exec`
+  (`PtraceSeccompExec`) tests, both still passing unchanged.
+
 ## Architecture and invariant ownership
 
 - Architecture shape: one new module,

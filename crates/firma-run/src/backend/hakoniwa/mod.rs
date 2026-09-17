@@ -36,7 +36,7 @@ const HAKONIWA_RUNNER_ENV: &str = "FIRMA_RUN_HAKONIWA_RUNNER";
 
 /// Version of the on-disk launch-contract schema `firma-hakoniwa-runner`
 /// understands. Must match `firma-hakoniwa-runner`'s own constant.
-const LAUNCH_CONTRACT_VERSION: u32 = 4;
+const LAUNCH_CONTRACT_VERSION: u32 = 5;
 
 /// Fixed in-sandbox path `firma` is bind-mounted at for the DNS-stub/
 /// proxy-bridge/egress-guarded-run orchestration (`DEC-003`) to exec — see
@@ -235,9 +235,9 @@ impl SandboxBackend for HakoniwaBackend {
         // way, and any *further* descendant exec is still independently
         // governed by both Landlock (this same allow-list, unchanged
         // otherwise) and whatever the selected strategy itself enforces.
-        if !allowed_executables.is_empty()
-            && launch.execution_governance != ExecutionGovernanceStrategy::Inherited
-        {
+        let alternate_exec_governance_active =
+            launch.execution_governance != ExecutionGovernanceStrategy::Inherited;
+        if !allowed_executables.is_empty() && alternate_exec_governance_active {
             allowed_executables.push(PathBuf::from(&launch.executable));
         }
 
@@ -250,6 +250,7 @@ impl SandboxBackend for HakoniwaBackend {
             mounts,
             deny_syscalls: launch.deny_syscalls.clone().unwrap_or_default(),
             allowed_executables,
+            landlock_optional: alternate_exec_governance_active,
         };
         let contract_path = write_launch_contract(&handle.runtime_dir, &contract)?;
 
@@ -357,6 +358,21 @@ struct HakoniwaLaunchContract {
     /// access set together, not just the modes actually used in `allow_path`
     /// calls).
     allowed_executables: Vec<PathBuf>,
+    /// Whether the runner may skip building the Landlock ruleset entirely
+    /// (rather than hard-failing the whole sandbox launch) when the host
+    /// kernel doesn't support Landlock at all.
+    ///
+    /// `true` exactly when a non-`Inherited` `execution_governance` strategy
+    /// is active: that strategy already enforces `allowed_executables`
+    /// independently (e.g. `PtraceSeccompExec`'s own ptrace-based exec gate),
+    /// so Landlock is redundant defense-in-depth on a kernel that has it and
+    /// a safe-to-drop mechanism (not the only enforcement) on one that
+    /// doesn't. Under the default `Inherited` strategy, Landlock is the
+    /// *only* enforcement of `allowed_executables`, so this stays `false` and
+    /// the runner preserves today's behavior: hard-fail closed if Landlock
+    /// is unsupported. See `docs/architecture/ptrace-seccomp-exec-gate-plan.md`
+    /// `DEC-021`.
+    landlock_optional: bool,
 }
 
 fn write_launch_contract(

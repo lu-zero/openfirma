@@ -23,7 +23,18 @@ use hakoniwa::{Container, Namespace, Runctl};
 use serde::{Deserialize, Serialize};
 
 /// Version of the on-disk launch-contract schema this binary understands.
-const LAUNCH_CONTRACT_VERSION: u32 = 4;
+const LAUNCH_CONTRACT_VERSION: u32 = 5;
+
+/// `flags` value that makes `landlock_create_ruleset(2)` behave as a pure
+/// ABI-version probe: with a null `attr` and zero `size`, the kernel returns
+/// the highest Landlock ABI version it supports instead of allocating a
+/// ruleset fd (so there is nothing to close on success), or a negative
+/// `errno` (`ENOSYS`/`EOPNOTSUPP`) when Landlock isn't supported at all.
+/// Verified against `/usr/include/linux/landlock.h`
+/// (`LANDLOCK_CREATE_RULESET_VERSION = 1U << 0`) and matches the `landlock`
+/// crate's own (deliberately private) internal probe of the same name in
+/// `landlock::compat::LandlockStatus::current`.
+const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1;
 
 /// Prefix stripped from the wrapped command's environment before the final
 /// exec (mirrors `bwrap_entrypoint.sh`'s own strip loop) — see
@@ -90,6 +101,13 @@ struct LaunchContract {
     mounts: Vec<MountOp>,
     deny_syscalls: Vec<String>,
     allowed_executables: Vec<PathBuf>,
+    /// Whether Landlock's ruleset may be skipped (rather than hard-failing
+    /// the whole sandbox launch) when this host's kernel doesn't support
+    /// Landlock at all. Set by `firma-run` exactly when a non-`Inherited`
+    /// `execution_governance` strategy is already enforcing
+    /// `allowed_executables` independently. See
+    /// [`landlock_kernel_support_available`].
+    landlock_optional: bool,
 }
 
 /// Mirrors `firma_run`'s `backend::hakoniwa::mount::HakoniwaMountOp`.
@@ -161,7 +179,16 @@ fn run(contract_path: &Path) -> Result<i32, RunnerError> {
         container.seccomp_filter(build_seccomp_filter(&contract.deny_syscalls));
     }
     if !contract.allowed_executables.is_empty() {
-        container.landlock_ruleset(build_landlock_ruleset(&contract.allowed_executables));
+        if landlock_kernel_support_available() || !contract.landlock_optional {
+            container.landlock_ruleset(build_landlock_ruleset(&contract.allowed_executables));
+        } else {
+            eprintln!(
+                "firma-hakoniwa-runner: Landlock is not supported on this kernel; skipping its \
+                 filesystem-confinement ruleset. The configured execution-governance strategy \
+                 enforces the executable allow-list independently, but Landlock's own broader \
+                 read/write restriction is not active on this host."
+            );
+        }
     }
 
     // SAFETY: the closure runs inside the already-unshared, already-mounted
@@ -302,6 +329,36 @@ fn build_landlock_ruleset(executables: &[PathBuf]) -> Ruleset {
         ruleset.allow_path(&executable.to_string_lossy(), FsAccess::R | FsAccess::X);
     }
     ruleset
+}
+
+/// Probes whether the running kernel supports Landlock at all, independent
+/// of any particular ABI version.
+///
+/// The `landlock` crate deliberately does not expose this itself — its own
+/// doc comment on `ABI`/`LandlockStatus` warns that "ABI should not be
+/// dynamically created ... to avoid inconsistent behaviors and
+/// non-determinism," and its internal probe (`LandlockStatus::current`) is a
+/// private fn for exactly that reason. This replicates the same underlying
+/// raw syscall directly: `landlock_create_ruleset(NULL, 0,
+/// LANDLOCK_CREATE_RULESET_VERSION)` is the kernel's documented "query
+/// supported ABI version" form, used here only to answer "supported or not,"
+/// not to pick an ABI to build a ruleset against — [`build_landlock_ruleset`]
+/// still goes through the `landlock`/`hakoniwa` crates' own ABI negotiation
+/// unchanged.
+fn landlock_kernel_support_available() -> bool {
+    // SAFETY: this is the kernel's documented ABI-version-probe calling
+    // form — a null `attr` with `size == 0` is required to be accepted, and
+    // the kernel neither reads through `attr` nor allocates an fd in this
+    // mode, so there is no memory to account for and nothing to close.
+    let version = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_create_ruleset,
+            std::ptr::null::<libc::c_void>(),
+            0_usize,
+            LANDLOCK_CREATE_RULESET_VERSION,
+        )
+    };
+    version >= 0
 }
 
 fn read_launch_contract(path: &Path) -> Result<LaunchContract, RunnerError> {

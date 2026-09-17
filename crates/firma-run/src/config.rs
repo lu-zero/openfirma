@@ -796,7 +796,9 @@ fn validate_execution_governance_preconditions(
         )));
     }
     if let Some(names) = crate::seccomp::resolve_deny_syscall_names(seccomp_policy)?
-        && names.iter().any(|name| *name == "execve" || *name == "execveat")
+        && names
+            .iter()
+            .any(|name| *name == "execve" || *name == "execveat")
     {
         return Err(RunError::ConfigValidation(format!(
             "execution_governance = '{strategy:?}' is pointless combined with a seccomp policy \
