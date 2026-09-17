@@ -39,8 +39,8 @@ use std::path::{Component, Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::backend::{
-    BackendKind, LaunchSpec, SandboxHandle, SandboxInfrastructureKind, SandboxMountAuthority,
-    SandboxMountPlacement,
+    BackendKind, LaunchSpec, SandboxHandle, SandboxInfrastructureKind, SandboxMount,
+    SandboxMountAuthority, SandboxMountPlacement,
 };
 use crate::config::MountSpec;
 use crate::error::RunError;
@@ -106,7 +106,15 @@ pub fn build_mount_ops(
 
     let mounts = validate_mounts(handle, &control_plane_runtime, &sandbox_runtime)?;
     reject_mount_sources_containing_runner_staging_dir(&mounts, launch)?;
+    let reconstructing_etc = handle.network_policy.enforce_network_namespace;
+    if reconstructing_etc {
+        reject_operator_mount_targeting_etc_anchor(&mounts)?;
+    }
     let mut ops = Vec::new();
+
+    if reconstructing_etc {
+        push_etc_reconstruction_anchor(&mut ops);
+    }
 
     bind_host_home(&mut ops, launch);
     ops.push(HakoniwaMountOp::Bind {
@@ -375,6 +383,7 @@ fn validate_infrastructure_mount(
             spec.target == Path::new("/etc/resolv.conf")
                 || spec.target == crate::backend::platform::resolve_resolv_conf_target()
         }
+        SandboxInfrastructureKind::Hosts => spec.target == Path::new("/etc/hosts"),
     };
     if spec.read_only && valid_target {
         return Ok(());
@@ -386,6 +395,97 @@ fn validate_infrastructure_mount(
             spec.target.display()
         ),
     })
+}
+
+/// Real host `/etc` paths re-bound read-only onto the reconstructed `/etc`
+/// (see [`push_etc_reconstruction_anchor`]) — an allowlist, not "copy
+/// everything except a blocklist": an unlisted path is simply absent.
+/// Existence-checked, skip-if-absent, mirroring `firma-hakoniwa-runner`'s own
+/// `LANDLOCK_READ_ONLY_DIRS`/`LANDLOCK_LIBRARY_DIRS` pattern.
+///
+/// See `docs/architecture/hakoniwa-etc-reconstruction-plan.md`, `DEC-002`,
+/// for the per-path rationale and what is deliberately excluded
+/// (`/etc/machine-id`, `/etc/hostname`, `/etc/ssl`/`/etc/pki`).
+const PRESERVED_ETC_HOST_PATHS: &[&str] = &[
+    "/etc/nsswitch.conf",
+    "/etc/ld.so.cache",
+    "/etc/ld.so.conf",
+    "/etc/ld.so.conf.d",
+    "/etc/localtime",
+    "/etc/passwd",
+    "/etc/group",
+    "/etc/services",
+    "/etc/protocols",
+];
+
+/// Builds ordinary framework-authority mounts for [`PRESERVED_ETC_HOST_PATHS`],
+/// each read-only from the real host at its own path. Flows through the same
+/// `validate_mounts`/`validate_overlay_destinations` pipeline as any operator
+/// mount once appended to `handle.mounts` by `HakoniwaBackend::prepare` — a
+/// collision with an operator mount targeting the same path is already
+/// caught by existing, unmodified validation.
+pub(super) fn preserved_etc_host_mounts() -> Vec<SandboxMount> {
+    PRESERVED_ETC_HOST_PATHS
+        .iter()
+        .filter(|path| Path::new(path).exists())
+        .map(|path| {
+            SandboxMount::framework(MountSpec {
+                source: PathBuf::from(path),
+                target: PathBuf::from(path),
+                read_only: true,
+            })
+        })
+        .collect()
+}
+
+/// Replaces `container.rootfs("/")`'s own `/etc` bind mount with a fresh,
+/// empty, writable tmpfs — the only op this reconstruction pushes directly
+/// into `ops`, bypassing the `SandboxMount` pipeline entirely (`Tmpfs` has no
+/// `MountSpec` representation at all), mirroring `mask_firma_dir`'s existing
+/// `emit_tmpfs` bypass for the same reason. Hakoniwa's own target-path mount
+/// ordering (module docs) then applies every deeper `/etc/*` `Bind` — the
+/// preserved paths above, plus the synthesized `resolv.conf`/`hosts` mounts
+/// `HakoniwaBackend::prepare` appends — on top of it, each able to `touch()`
+/// its own placeholder inside the fresh tmpfs instead of the real, root-owned
+/// host file. See `docs/architecture/hakoniwa-etc-reconstruction-plan.md`,
+/// `DEC-001`.
+fn push_etc_reconstruction_anchor(ops: &mut Vec<HakoniwaMountOp>) {
+    ops.push(HakoniwaMountOp::Tmpfs {
+        target: PathBuf::from("/etc"),
+    });
+}
+
+/// Fails closed if any non-infrastructure mount targets exactly `/etc` — the
+/// one path [`push_etc_reconstruction_anchor`] pushes outside the
+/// `SandboxMount` pipeline, so it is invisible to
+/// `validate_overlay_destinations`'s ordinary duplicate-target check.
+/// Container's own mount table is a `HashMap` keyed by target (last insert
+/// wins, module docs), so without this check an operator mount at `/etc`
+/// could silently defeat the whole reconstruction depending on unrelated
+/// code ordering, with no diagnostic either way. Deliberately narrower than
+/// rejecting every `/etc/*` target: a mount under a *deeper* path (e.g.
+/// `/etc/my-app.conf`) is legitimate and lands correctly on the reconstructed
+/// tmpfs with no collision at all. See
+/// `docs/architecture/hakoniwa-etc-reconstruction-plan.md`, `DEC-008`.
+fn reject_operator_mount_targeting_etc_anchor(mounts: &[ValidatedMount]) -> Result<(), RunError> {
+    for mount in mounts {
+        if matches!(
+            mount.authority,
+            SandboxMountAuthority::SandboxInfrastructure(_)
+        ) {
+            continue;
+        }
+        if normalize_absolute_path(&mount.spec.target) == Path::new("/etc") {
+            return Err(RunError::Backend {
+                backend: BackendKind::Hakoniwa.to_string(),
+                reason: format!(
+                    "mount target {} is reserved for hakoniwa's own /etc reconstruction anchor",
+                    mount.spec.target.display()
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Resolve an absolute mount path through every existing symlink while
@@ -730,11 +830,12 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        HakoniwaMountOp, SandboxMountAuthority, SandboxMountPlacement, ValidatedMount,
-        mask_firma_dir, project_mount_aliases, reject_mount_sources_containing_runner_staging_dir,
-        reject_overlay_targets_inside_masked_zones,
+        HakoniwaMountOp, PRESERVED_ETC_HOST_PATHS, SandboxMountAuthority, SandboxMountPlacement,
+        ValidatedMount, mask_firma_dir, preserved_etc_host_mounts, project_mount_aliases,
+        push_etc_reconstruction_anchor, reject_mount_sources_containing_runner_staging_dir,
+        reject_operator_mount_targeting_etc_anchor, reject_overlay_targets_inside_masked_zones,
     };
-    use crate::backend::LaunchSpec;
+    use crate::backend::{LaunchSpec, SandboxInfrastructureKind};
     use crate::config::MountSpec;
 
     /// Pins `HOME` to a non-existent path so `host_home_firma_dir` does not fall
@@ -947,5 +1048,100 @@ mod tests {
 
         reject_mount_sources_containing_runner_staging_dir(&mounts, &launch)
             .expect("an ordinary workspace directory must be allowed");
+    }
+
+    // -- /etc reconstruction (docs/architecture/hakoniwa-etc-reconstruction-plan.md) --
+
+    #[test]
+    fn push_etc_reconstruction_anchor_emits_etc_tmpfs() {
+        let mut ops = Vec::new();
+        push_etc_reconstruction_anchor(&mut ops);
+        assert!(tmpfs_targets(&ops).contains(&std::path::PathBuf::from("/etc")));
+    }
+
+    #[test]
+    fn reject_operator_mount_targeting_etc_anchor_rejects_exact_etc_target() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mounts = vec![operator_mount(temp.path().to_path_buf(), "/etc")];
+
+        let error = reject_operator_mount_targeting_etc_anchor(&mounts)
+            .expect_err("an operator mount targeting exactly /etc must be rejected");
+        assert!(error.to_string().contains("/etc"));
+    }
+
+    #[test]
+    fn reject_operator_mount_targeting_etc_anchor_allows_deeper_etc_subpath() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mounts = vec![operator_mount(
+            temp.path().to_path_buf(),
+            "/etc/my-app.conf",
+        )];
+
+        reject_operator_mount_targeting_etc_anchor(&mounts)
+            .expect("an operator mount under a deeper /etc/* path must be allowed");
+    }
+
+    #[test]
+    fn reject_operator_mount_targeting_etc_anchor_allows_sandbox_infrastructure_at_etc() {
+        // The reconstruction's own synthesized mounts (resolv.conf/hosts)
+        // never target /etc itself, but this check must not reject
+        // SandboxInfrastructure-authority mounts regardless of target,
+        // matching the same exemption `reject_overlay_targets_inside_masked_zones`
+        // already uses.
+        let mounts = vec![ValidatedMount {
+            spec: MountSpec {
+                source: std::path::PathBuf::from("/dev/null"),
+                target: std::path::PathBuf::from("/etc"),
+                read_only: true,
+            },
+            authority: SandboxMountAuthority::SandboxInfrastructure(
+                SandboxInfrastructureKind::Hosts,
+            ),
+            placement: SandboxMountPlacement::Overlay,
+        }];
+
+        reject_operator_mount_targeting_etc_anchor(&mounts)
+            .expect("a SandboxInfrastructure-authority mount must be exempt from this check");
+    }
+
+    #[test]
+    fn preserved_etc_host_mounts_only_includes_paths_that_exist() {
+        let mounts = preserved_etc_host_mounts();
+        // /etc/passwd and /etc/group are as close to universally present on
+        // any Linux host capable of running this test suite at all as any
+        // path on this list gets — asserting they're included keeps this
+        // test from vacuously passing with zero mounts checked on a
+        // hypothetical minimal image missing every other preserved path.
+        let targets: Vec<&std::path::Path> = mounts
+            .iter()
+            .map(|mount| mount.spec().target.as_path())
+            .collect();
+        assert!(
+            targets.contains(&std::path::Path::new("/etc/passwd")),
+            "expected /etc/passwd among the preserved mounts on this host"
+        );
+        assert!(
+            targets.contains(&std::path::Path::new("/etc/group")),
+            "expected /etc/group among the preserved mounts on this host"
+        );
+        for mount in &mounts {
+            let spec = mount.spec();
+            assert!(
+                PRESERVED_ETC_HOST_PATHS.contains(
+                    &spec
+                        .target
+                        .to_str()
+                        .expect("preserved path must be valid utf-8")
+                ),
+                "unexpected preserved target {}",
+                spec.target.display()
+            );
+            assert!(spec.source.exists(), "{} must exist", spec.source.display());
+            assert!(
+                spec.read_only,
+                "{} must be read-only",
+                spec.target.display()
+            );
+        }
     }
 }

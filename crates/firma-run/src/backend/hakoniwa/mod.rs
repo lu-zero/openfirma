@@ -21,7 +21,7 @@ use serde::Serialize;
 use crate::backend::platform;
 use crate::backend::{
     BackendKind, EnforcementProof, LaunchSpec, NetworkConfinement, PrepareRequest, SandboxBackend,
-    SandboxHandle, SandboxMount,
+    SandboxHandle, SandboxInfrastructureKind, SandboxMount,
 };
 use crate::config::{ExecutionGovernanceStrategy, NetworkPolicy, SandboxIdentityMode};
 use crate::error::RunError;
@@ -73,42 +73,88 @@ impl SandboxBackend for HakoniwaBackend {
 
         let runtime_dir = create_hakoniwa_runtime_dir(&request.identity.sandbox_id)?;
 
-        // NOTE: identity-mode (fake /etc/passwd, /etc/group — see
-        // `HakoniwaLaunchContract`'s own doc comment) and resolv.conf
-        // stub-pointing (mirroring `BwrapBackend::prepare`) were prototyped
-        // here and reverted. `firma-hakoniwa-runner`'s `container.rootfs("/")`
-        // reuses the host's real `/bin`/`/etc`/`/usr`/etc. directories as
-        // read-only bind mounts wholesale (`hakoniwa::Container::rootfs`'s own
-        // `rootfs_imp`), so `/etc/passwd`, `/etc/group`, and `/etc/resolv.conf`
-        // inside the sandbox are the real, root-owned host files — confirmed
-        // live: attempting to overlay our own content at those exact paths
-        // fails with `touch("etc/group") => Permission denied`, because
-        // hakoniwa's own mount-target-creation step (`sys::touch`/`sys::fwrite`
-        // in the `hakoniwa` crate) opens the *real* target file for
-        // write/append rather than creating a fresh placeholder in
-        // hakoniwa's own staging area the way `bwrap`'s selectively-built
-        // rootfs does. This is a genuine architectural gap, not a simple
-        // porting task: closing it needs `/etc` reconstructed as a fresh,
-        // writable layer (e.g. a tmpfs mounted at `/etc` ahead of these
-        // three files in hakoniwa's own target-path mount ordering) without
-        // silently dropping real host `/etc` content (locale data,
-        // `ca-certificates`, `nsswitch.conf`) many programs need — a design
-        // decision, not ported here. Two real, previously-undiscovered
-        // findings survive from this investigation regardless of the fix:
-        // (1) `/etc/resolv.conf`'s real contents (nameserver IPs, search
-        // domain) are currently readable from inside a Hakoniwa sandbox,
-        // though network-namespace isolation blocks any real query those
-        // nameservers would need; (2) ordinary resolver-based DNS lookups
-        // (`getaddrinfo`) never reach the sandbox's own DNS-refusal stub at
-        // all today — only a query hard-coded to `127.0.0.1:53` does, unlike
-        // `BwrapBackend`, which always gets a deterministic stub `REFUSED`.
-        let mounts = request
+        let mut mounts = request
             .profile
             .mounts
             .iter()
             .cloned()
             .map(SandboxMount::operator_provided)
             .collect::<Vec<_>>();
+
+        // `/etc` reconstruction (`docs/architecture/hakoniwa-etc-reconstruction-plan.md`).
+        // `firma-hakoniwa-runner`'s `container.rootfs("/")` reuses the host's
+        // real `/etc` wholesale as a read-only bind, so overlaying our own
+        // content at a single path under it (e.g. `/etc/resolv.conf`) used to
+        // fail with `touch("etc/group") => Permission denied` — the real,
+        // root-owned host file was still there. `mount::build_mount_ops` now
+        // replaces `/etc` with a fresh tmpfs first (`DEC-001`) and re-binds a
+        // reviewed allowlist of real host paths on top
+        // (`preserved_etc_host_mounts`, `DEC-002`); this block synthesizes the
+        // two remaining paths that must NOT be the real host content.
+        // Gated identically to `BwrapBackend::prepare`'s own resolv.conf
+        // synthesis (`DEC-003`): cooperative-routing-mode `/etc` is left
+        // exactly as `rootfs("/")` already provides it, unchanged.
+        if request.profile.network.enforce_network_namespace {
+            mounts.extend(mount::preserved_etc_host_mounts());
+
+            // DEC-004: same stub content `BwrapBackend::prepare` writes,
+            // reusing the existing `SandboxInfrastructureKind::ResolverConfig`
+            // mechanism (already validated, previously just never invoked for
+            // this backend).
+            let resolv_conf_path = runtime_dir.join("resolv.conf");
+            std::fs::write(
+                &resolv_conf_path,
+                "nameserver 127.0.0.1\noptions ndots:0 timeout:1 attempts:1\n",
+            )
+            .map_err(|error| RunError::Backend {
+                backend: BackendKind::Hakoniwa.to_string(),
+                reason: format!(
+                    "failed to write sandbox resolv.conf {}: {error}",
+                    resolv_conf_path.display()
+                ),
+            })?;
+
+            // On hosts where /etc/resolv.conf is a managed symlink (e.g. WSL,
+            // systemd-resolved), mount(2) follows the symlink to its
+            // canonical target — mirrors `BwrapBackend::prepare`'s identical
+            // handling.
+            let resolv_conf_target = platform::resolve_resolv_conf_target();
+            if resolv_conf_target != std::path::Path::new("/etc/resolv.conf") {
+                mounts.push(SandboxMount::sandbox_infrastructure(
+                    SandboxInfrastructureKind::ResolverConfig,
+                    resolv_conf_path.clone(),
+                    resolv_conf_target,
+                ));
+            }
+            mounts.push(SandboxMount::sandbox_infrastructure(
+                SandboxInfrastructureKind::ResolverConfig,
+                resolv_conf_path,
+                PathBuf::from("/etc/resolv.conf"),
+            ));
+
+            // DEC-006: a minimal, loopback-only stub. The real host
+            // `/etc/hosts` is never bound in — glibc's NSS `hosts:` order
+            // consults it *before* `dns`, so a real static entry would
+            // resolve without ever reaching the sandbox's own DNS-refusal
+            // stub, undermining this whole mechanism.
+            let hosts_path = runtime_dir.join("hosts");
+            std::fs::write(
+                &hosts_path,
+                "127.0.0.1 localhost\n::1 localhost ip6-localhost ip6-loopback\n",
+            )
+            .map_err(|error| RunError::Backend {
+                backend: BackendKind::Hakoniwa.to_string(),
+                reason: format!(
+                    "failed to write sandbox hosts file {}: {error}",
+                    hosts_path.display()
+                ),
+            })?;
+            mounts.push(SandboxMount::sandbox_infrastructure(
+                SandboxInfrastructureKind::Hosts,
+                hosts_path,
+                PathBuf::from("/etc/hosts"),
+            ));
+        }
 
         Ok(SandboxHandle {
             backend: BackendKind::Hakoniwa,

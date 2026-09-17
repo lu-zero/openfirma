@@ -974,6 +974,13 @@ fn validate_infrastructure_mount(
             spec.target == Path::new("/etc/resolv.conf")
                 || spec.target == crate::backend::platform::resolve_resolv_conf_target()
         }
+        // `BwrapBackend` never constructs a `Hosts` mount today (that
+        // synthesis is `HakoniwaBackend`-only — see
+        // `docs/architecture/hakoniwa-etc-reconstruction-plan.md`, `DEC-006`);
+        // this arm exists only to keep the match exhaustive over the shared
+        // enum, with the same target contract `HakoniwaBackend`'s own arm
+        // uses if it were ever exercised here.
+        SandboxInfrastructureKind::Hosts => spec.target == Path::new("/etc/hosts"),
     };
     if spec.read_only && valid_target {
         return Ok(());

@@ -215,6 +215,11 @@ pub(in crate::backend) enum SandboxInfrastructureKind {
     /// Resolver configuration mounted at `/etc/resolv.conf` or its host-side
     /// canonical target.
     ResolverConfig,
+    /// Synthesized loopback-only hosts file mounted at `/etc/hosts`, used by
+    /// `HakoniwaBackend`'s `/etc` reconstruction to keep a real host
+    /// `/etc/hosts` entry from resolving without ever consulting DNS (see
+    /// `docs/architecture/hakoniwa-etc-reconstruction-plan.md`, `DEC-006`).
+    Hosts,
 }
 
 /// Layer in which a prepared mount may be emitted by an ordered backend.

@@ -249,6 +249,273 @@ fn hakoniwa_backend_dns_stub_answers_real_queries() {
     );
 }
 
+/// Reads back `/etc/nsswitch.conf`/`/etc/hosts`/`/etc/resolv.conf` and
+/// reports whether `/etc/machine-id` exists — `docs/architecture/hakoniwa-etc-reconstruction-plan.md`'s
+/// `PROOF-ETC-002` (the `/etc` reconstruction half).
+const ETC_RECONSTRUCTION_SCRIPT: &str = r"
+echo NSSWITCH_BEGIN
+cat /etc/nsswitch.conf
+echo NSSWITCH_END
+echo HOSTS_BEGIN
+cat /etc/hosts
+echo HOSTS_END
+echo RESOLV_BEGIN
+cat /etc/resolv.conf
+echo RESOLV_END
+if [ -e /etc/machine-id ]; then echo MACHINE_ID_STATUS=PRESENT; else echo MACHINE_ID_STATUS=ABSENT; fi
+";
+
+/// Extracts the trimmed text between the first `start_marker`...`end_marker`
+/// pair in `output` (each expected on its own line), or an empty string if
+/// either marker is missing.
+fn extract_between(output: &str, start_marker: &str, end_marker: &str) -> String {
+    output
+        .split(start_marker)
+        .nth(1)
+        .and_then(|after_start| after_start.split(end_marker).next())
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+/// `docs/architecture/hakoniwa-etc-reconstruction-plan.md`, `PROOF-ETC-002`
+/// (Slice 1: preserved-content half; Slice 2: synthesized-content half).
+///
+/// Proves the `/etc` reconstruction does what `DEC-002`/`DEC-004`/`DEC-006`
+/// claim: a preserved path (`/etc/nsswitch.conf`) shows the real host's own
+/// content unchanged, while `/etc/hosts`/`/etc/resolv.conf` show only
+/// synthesized content — never the real host's — and `/etc/machine-id` is
+/// absent rather than exposing a real host identifier.
+#[test]
+fn hakoniwa_backend_etc_reconstruction_preserves_and_replaces_expected_paths() {
+    let Some(runner) = hakoniwa_runner_path() else {
+        eprintln!(
+            "skipping hakoniwa_backend_etc_reconstruction_preserves_and_replaces_expected_paths: \
+             firma-hakoniwa-runner was not built (run `cargo build --workspace` or `cargo \
+             nextest run` without `-p` to build it)"
+        );
+        return;
+    };
+    let bash = first_existing(&["/usr/bin/bash", "/bin/bash"])
+        .unwrap_or_else(|| panic!("bash must be installed in the test environment"));
+    let Ok(host_nsswitch) = std::fs::read_to_string("/etc/nsswitch.conf") else {
+        eprintln!(
+            "skipping hakoniwa_backend_etc_reconstruction_preserves_and_replaces_expected_paths: \
+             this host has no /etc/nsswitch.conf to compare against"
+        );
+        return;
+    };
+    let host_hosts = std::fs::read_to_string("/etc/hosts").unwrap_or_default();
+
+    let world = TestWorld::isolated();
+    let cfg_dir = world.path("config");
+    let state_dir = world.state_path();
+    let workspace = world.workspace_path();
+
+    world.scaffold_config(
+        "generic",
+        &cfg_dir,
+        &state_dir,
+        Some(&workspace),
+        &workspace,
+    );
+    let config_path = cfg_dir.join("firma.toml");
+    patch_backend_to_hakoniwa(&config_path);
+
+    let mut command = world.isolated_command_in(env!("CARGO_BIN_EXE_firma"), &workspace);
+    command
+        .env("FIRMA_RUN_HAKONIWA_RUNNER", &runner)
+        .args(["run", "--profile", "generic", "--config"])
+        .arg(&config_path)
+        .args(["--sidecar", "local", "--authority", "local", "--"])
+        .arg(&bash)
+        .arg("-c")
+        .arg(ETC_RECONSTRUCTION_SCRIPT);
+    let output = run_bounded(&mut command, Duration::from_mins(2));
+
+    assert!(
+        output.success(),
+        "hakoniwa /etc-reconstruction run failed:\n{output}"
+    );
+
+    let sandboxed_nsswitch = extract_between(&output.stdout, "NSSWITCH_BEGIN", "NSSWITCH_END");
+    assert_eq!(
+        sandboxed_nsswitch,
+        host_nsswitch.trim(),
+        "preserved /etc/nsswitch.conf must match the real host's content unchanged:\n{output}"
+    );
+
+    let sandboxed_hosts = extract_between(&output.stdout, "HOSTS_BEGIN", "HOSTS_END");
+    assert!(
+        sandboxed_hosts.contains("127.0.0.1 localhost"),
+        "synthesized /etc/hosts must contain the loopback stub:\n{output}"
+    );
+    assert_ne!(
+        sandboxed_hosts,
+        host_hosts.trim(),
+        "sandboxed /etc/hosts must not match the real host's file:\n{output}"
+    );
+
+    let sandboxed_resolv = extract_between(&output.stdout, "RESOLV_BEGIN", "RESOLV_END");
+    assert!(
+        sandboxed_resolv.contains("nameserver 127.0.0.1"),
+        "synthesized /etc/resolv.conf must point at the sandbox's own DNS stub:\n{output}"
+    );
+
+    assert!(
+        output.stdout.contains("MACHINE_ID_STATUS=ABSENT"),
+        "/etc/machine-id must not be exposed inside the sandbox:\n{output}"
+    );
+}
+
+/// `docs/architecture/hakoniwa-etc-reconstruction-plan.md`'s `PLAN-001`
+/// correction: no existing e2e test, for either backend, actually exercised
+/// `SandboxIdentityMode::SandboxUser`'s in-sandbox resolution behavior before
+/// this test. Proves `id`/`whoami` inside a `SandboxUser`-mode sandbox
+/// (the scaffolded `generic` profile's own default identity mode) resolve to
+/// `Container::uidmap`/`gidmap`'s real, kernel-level remap target — `nobody`'s
+/// uid/gid (`65534`) — not the real host identity.
+#[test]
+fn hakoniwa_backend_sandbox_user_identity_resolves_to_nobody() {
+    let Some(runner) = hakoniwa_runner_path() else {
+        eprintln!(
+            "skipping hakoniwa_backend_sandbox_user_identity_resolves_to_nobody: \
+             firma-hakoniwa-runner was not built (run `cargo build --workspace` or `cargo \
+             nextest run` without `-p` to build it)"
+        );
+        return;
+    };
+    let bash = first_existing(&["/usr/bin/bash", "/bin/bash"])
+        .unwrap_or_else(|| panic!("bash must be installed in the test environment"));
+
+    let world = TestWorld::isolated();
+    let cfg_dir = world.path("config");
+    let state_dir = world.state_path();
+    let workspace = world.workspace_path();
+
+    world.scaffold_config(
+        "generic",
+        &cfg_dir,
+        &state_dir,
+        Some(&workspace),
+        &workspace,
+    );
+    let config_path = cfg_dir.join("firma.toml");
+    patch_backend_to_hakoniwa(&config_path);
+
+    let mut command = world.isolated_command_in(env!("CARGO_BIN_EXE_firma"), &workspace);
+    command
+        .env("FIRMA_RUN_HAKONIWA_RUNNER", &runner)
+        .args(["run", "--profile", "generic", "--config"])
+        .arg(&config_path)
+        .args(["--sidecar", "local", "--authority", "local", "--"])
+        .arg(&bash)
+        .arg("-c")
+        .arg("id -u; id -g; whoami");
+    let output = run_bounded(&mut command, Duration::from_mins(2));
+
+    assert!(
+        output.success(),
+        "hakoniwa SandboxUser identity run failed:\n{output}"
+    );
+    let mut lines = output.stdout.lines();
+    assert_eq!(
+        lines.next(),
+        Some("65534"),
+        "uid must resolve to nobody's uid:\n{output}"
+    );
+    assert_eq!(
+        lines.next(),
+        Some("65534"),
+        "gid must resolve to nogroup's gid:\n{output}"
+    );
+    assert_eq!(
+        lines.next(),
+        Some("nobody"),
+        "whoami must resolve to nobody:\n{output}"
+    );
+}
+
+/// `docs/architecture/hakoniwa-etc-reconstruction-plan.md`, `DEC-007`/
+/// `PROOF-ETC-001`. Proves ordinary resolver-based DNS resolution (plain
+/// `socket.getaddrinfo`, no raw sockets — unlike
+/// `hakoniwa_backend_dns_stub_answers_real_queries`'s hand-crafted UDP
+/// query) reaches the sandbox's own DNS-refusal stub and fails predictably.
+/// Queries a `.invalid`-TLD name (reserved, RFC 2606) so this test cannot
+/// pass by accident even if confinement were somehow bypassed and the query
+/// reached the real internet.
+const GETADDRINFO_SCRIPT: &str = r#"
+python3 - <<'PYEOF'
+import socket
+import sys
+
+try:
+    result = socket.getaddrinfo("firma-e2e-getaddrinfo-probe.invalid", 80)
+    print(f"CHILD GETADDRINFO UNEXPECTED SUCCESS {result}")
+    sys.exit(1)
+except socket.gaierror as error:
+    print(f"CHILD GETADDRINFO FAILED errno={error.errno}")
+    sys.exit(0)
+PYEOF
+"#;
+
+#[test]
+fn hakoniwa_backend_getaddrinfo_reaches_dns_stub() {
+    let Some(runner) = hakoniwa_runner_path() else {
+        eprintln!(
+            "skipping hakoniwa_backend_getaddrinfo_reaches_dns_stub: firma-hakoniwa-runner was \
+             not built (run `cargo build --workspace` or `cargo nextest run` without `-p` to \
+             build it)"
+        );
+        return;
+    };
+    let bash = first_existing(&["/usr/bin/bash", "/bin/bash"])
+        .unwrap_or_else(|| panic!("bash must be installed in the test environment"));
+    let python3 = first_existing(&["/usr/bin/python3", "/bin/python3"]);
+    if python3.is_none() {
+        eprintln!(
+            "skipping hakoniwa_backend_getaddrinfo_reaches_dns_stub: python3 was not found on \
+             this host"
+        );
+        return;
+    }
+
+    let world = TestWorld::isolated();
+    let cfg_dir = world.path("config");
+    let state_dir = world.state_path();
+    let workspace = world.workspace_path();
+
+    world.scaffold_config(
+        "generic",
+        &cfg_dir,
+        &state_dir,
+        Some(&workspace),
+        &workspace,
+    );
+    let config_path = cfg_dir.join("firma.toml");
+    patch_backend_to_hakoniwa(&config_path);
+
+    let mut command = world.isolated_command_in(env!("CARGO_BIN_EXE_firma"), &workspace);
+    command
+        .env("FIRMA_RUN_HAKONIWA_RUNNER", &runner)
+        .args(["run", "--profile", "generic", "--config"])
+        .arg(&config_path)
+        .args(["--sidecar", "local", "--authority", "local", "--"])
+        .arg(&bash)
+        .arg("-c")
+        .arg(GETADDRINFO_SCRIPT);
+    let output = run_bounded(&mut command, Duration::from_mins(2));
+
+    assert!(
+        output.success(),
+        "plain getaddrinfo call did not fail as expected:\n{output}"
+    );
+    assert!(
+        output.stdout.contains("CHILD GETADDRINFO FAILED"),
+        "ordinary resolver-based DNS resolution did not reach the sandbox's own stub:\n{output}"
+    );
+}
+
 /// Tries to bind `127.0.0.1:80` (a privileged port unrelated to the DNS
 /// stub) and reports the outcome — `CHILD BIND OK` or `CHILD BIND
 /// FAILED: <errno>`.
